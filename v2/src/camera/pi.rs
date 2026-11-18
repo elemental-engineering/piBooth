@@ -14,7 +14,7 @@ use anyhow::{Context, anyhow, bail};
 use libcamera::camera::CameraConfigurationStatus;
 use libcamera::camera_manager::CameraManager;
 use libcamera::control::ControlList;
-use libcamera::controls::FrameDurationLimits;
+use libcamera::controls::{AnalogueGain, ExposureTime, FrameDuration, FrameDurationLimits, SensorTimestamp};
 use libcamera::framebuffer::AsFrameBuffer;
 use libcamera::framebuffer_allocator::{FrameBuffer, FrameBufferAllocator};
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
@@ -26,6 +26,7 @@ use libcamera::stream::StreamRole;
 use super::{Camera, SENSOR_FPS, SENSOR_SIZE};
 use crate::config::CameraCfg;
 use crate::frame::{Frame, FrameMailbox, copy_packed};
+use crate::stats::{FrameSample, FrameTiming};
 
 /// libcamera `BGR888` = DRM `BG24`: bytes in memory are R, G, B, which is
 /// what GL `RGB` expects. (libcamera `RGB888` is B, G, R in memory.)
@@ -179,8 +180,12 @@ fn session(
     }
     let _ = ready.send(Ok(()));
 
+    tracing::info!(frame_duration_us = frame_us, "requested fixed frame duration");
+
     let (w, h) = (size.width, size.height);
     let row_bytes = w as usize * 3;
+    let mut timing = FrameTiming::default();
+    let mut last_report = Instant::now();
     while running.load(Ordering::SeqCst) {
         let mut req = match done_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(r) => r,
@@ -194,10 +199,37 @@ fn session(
             let fb: &MemoryMappedFrameBuffer<FrameBuffer> =
                 req.buffer(&stream).ok_or_else(|| anyhow!("request without buffer"))?;
             let seq = fb.metadata().map(|m| m.sequence() as u64).unwrap_or(0);
+            let copy_start = Instant::now();
             let planes = fb.data();
             let mut data = mailbox.take_buffer(Frame::byte_len(w, h));
             copy_packed(planes[0], stride, row_bytes, h as usize, &mut data);
+            let copy_us = copy_start.elapsed().as_micros() as u64;
             mailbox.publish(Frame { width: w, height: h, data, seq, captured_at: Instant::now() });
+            let md = req.metadata();
+            timing.record(FrameSample {
+                seq,
+                sensor_ts_ns: md.get::<SensorTimestamp>().ok().map(|v| v.0),
+                frame_duration_us: md.get::<FrameDuration>().ok().map(|v| v.0),
+                exposure_us: md.get::<ExposureTime>().ok().map(|v| v.0),
+                gain: md.get::<AnalogueGain>().ok().map(|v| v.0),
+                copy_us,
+            });
+        } else {
+            tracing::debug!(status = ?req.status(), "request not complete");
+        }
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            last_report = Instant::now();
+            let t = timing.take_summary();
+            tracing::info!(
+                frames = t.frames,
+                dropped = t.dropped,
+                sensor_fps = t.sensor_fps.map(|f| (f * 10.0).round() / 10.0),
+                frame_duration_us = t.frame_duration_us.map(|d| d.round()),
+                exposure_us_max = t.exposure_us_max,
+                gain_mean = t.gain_mean.map(|g| (g * 100.0).round() / 100.0),
+                copy_us_max = t.copy_us_max,
+                "camera"
+            );
         }
         req.reuse(ReuseFlag::REUSE_BUFFERS);
         cam.queue_request(req).map_err(|(_, e)| e).context("re-queueing request")?;
