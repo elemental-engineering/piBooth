@@ -3,6 +3,8 @@
 //! Nothing here touches GL; [`scene::compose`] outputs [`Overlay`]s that
 //! the renderer draws.
 
+pub mod assets;
+pub mod scene;
 pub mod text;
 
 use crate::geometry::Rect;
