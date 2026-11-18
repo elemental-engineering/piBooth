@@ -7,6 +7,9 @@ use crate::frame::FrameMailbox;
 
 pub mod fake;
 
+#[cfg(feature = "libcamera")]
+pub mod pi;
+
 /// IMX296 native resolution (spec §1).
 pub const SENSOR_SIZE: (u32, u32) = (1456, 1088);
 /// Sensor maximum frame rate at full resolution.
