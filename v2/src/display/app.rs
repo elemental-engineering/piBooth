@@ -193,6 +193,7 @@ impl App {
                     gfx.renderer.set_mirror(m);
                     tracing::info!(mirror = m, "mirror toggled");
                 }
+                self.refresh_debug_text();
             }
             Some(_) | None => {}
         }
@@ -233,6 +234,8 @@ impl ApplicationHandler for App {
                     if let Err(e) = gfx.hud.resize(&mut gfx.renderer) {
                         self.error = Some(e.context("re-rendering the OSD"));
                         event_loop.exit();
+                    } else {
+                        self.refresh_debug_text();
                     }
                 }
             }

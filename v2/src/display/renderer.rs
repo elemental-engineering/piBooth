@@ -43,7 +43,6 @@ void main() {
 
 struct Sprite {
     texture: glow::Texture,
-    size: (u32, u32),
 }
 
 pub struct Renderer {
@@ -83,7 +82,7 @@ impl Renderer {
             }
             let tint_loc = gl.get_uniform_location(overlay_program, "u_tint");
             gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            gl.blend_func_separate(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA, glow::ZERO, glow::ONE);
 
             Ok(Self {
                 gl,
@@ -172,7 +171,7 @@ impl Renderer {
     pub fn create_sprite(&mut self, image: &Rgba) -> anyhow::Result<SpriteId> {
         let texture = unsafe { new_texture(&self.gl)? };
         let id = SpriteId(self.sprites.len());
-        self.sprites.push(Some(Sprite { texture, size: (0, 0) }));
+        self.sprites.push(Some(Sprite { texture }));
         self.update_sprite(id, image);
         Ok(id)
     }
@@ -195,7 +194,6 @@ impl Renderer {
                 glow::PixelUnpackData::Slice(Some(&image.data)),
             );
         }
-        sprite.size = (image.width, image.height);
     }
 
     pub fn delete_sprite(&mut self, id: SpriteId) {
