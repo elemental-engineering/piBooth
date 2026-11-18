@@ -2,10 +2,12 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use pibooth::camera::{Camera, SENSOR_FPS, SENSOR_SIZE, fake::FakeCamera};
+use std::time::Instant;
+
+use pibooth::camera::{SENSOR_FPS, SENSOR_SIZE, fake::FakeCamera};
 use pibooth::config::Config;
-use pibooth::display::{self, RunOptions};
-use pibooth::frame::FrameMailbox;
+use pibooth::display::{self, CameraFactory, Controller, RunOptions};
+use pibooth::input::GpioButton;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -17,7 +19,7 @@ struct Cli {
     /// Use the animated test pattern instead of the Pi camera.
     #[arg(long)]
     fake_camera: bool,
-    /// Disable GPIO (keyboard only). Accepted now, used from milestone 2.
+    /// Disable the GPIO button (keyboard only).
     #[arg(long)]
     no_gpio: bool,
     /// Log display/camera frame rates every second.
@@ -36,25 +38,40 @@ fn main() -> anyhow::Result<()> {
     let cfg = Config::load(cli.config.as_deref()).context("loading configuration")?;
     tracing::info!(upload = cfg.upload_enabled(), "configuration loaded");
 
-    let mailbox = FrameMailbox::new();
-    let mut camera = make_camera(&cli, &cfg)?;
-    camera.start(mailbox.clone()).context("starting camera")?;
-
-    let result = display::run(
-        mailbox,
-        RunOptions { mirror: cfg.display.mirror_preview, bench: cli.bench, windowed: cli.windowed },
-    );
-    camera.stop();
-    result
+    let (tx, rx) = std::sync::mpsc::channel();
+    let button = if cli.no_gpio {
+        None
+    } else {
+        match GpioButton::start(&cfg.button, tx) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!("button unavailable, keyboard only: {e:#}");
+                None
+            }
+        }
+    };
+    let ctrl =
+        Controller::start(&cfg, camera_factory(&cli, &cfg)?, button, rx, Instant::now()).context("starting camera")?;
+    display::run(
+        ctrl,
+        RunOptions {
+            mirror: cfg.display.mirror_preview,
+            bench: cli.bench,
+            windowed: cli.windowed,
+            assets_dir: cfg.display.assets_dir.clone(),
+            countdown_max: cfg.timing.countdown_s,
+        },
+    )
 }
 
-fn make_camera(cli: &Cli, cfg: &Config) -> anyhow::Result<Box<dyn Camera>> {
+fn camera_factory(cli: &Cli, cfg: &Config) -> anyhow::Result<CameraFactory> {
     if cli.fake_camera {
-        return Ok(Box::new(FakeCamera::new(SENSOR_SIZE, SENSOR_FPS)));
+        return Ok(Box::new(|| Box::new(FakeCamera::new(SENSOR_SIZE, SENSOR_FPS))));
     }
     #[cfg(feature = "libcamera")]
     {
-        Ok(Box::new(pibooth::camera::pi::PiCamera::new(cfg.camera.clone())))
+        let cam_cfg = cfg.camera.clone();
+        Ok(Box::new(move || Box::new(pibooth::camera::pi::PiCamera::new(cam_cfg.clone()))))
     }
     #[cfg(not(feature = "libcamera"))]
     {

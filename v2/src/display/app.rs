@@ -1,9 +1,10 @@
-//! winit application: creates the fullscreen GLES window, and on every
-//! redraw uploads the newest camera frame and presents it with vsync.
+//! winit application: creates the fullscreen GLES window and, on every
+//! redraw, advances the booth, uploads the newest camera frame and draws it
+//! with the OSD on top, presenting with vsync.
 
 use std::ffi::CString;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
@@ -17,11 +18,13 @@ use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
+use super::controller::Controller;
+use super::hud::Hud;
 use super::renderer::Renderer;
-use crate::frame::FrameMailbox;
+use crate::input::{Action, map_key};
+use crate::osd::scene::{DebugInfo, compose, debug_text};
 use crate::stats::RateMeter;
 
 pub struct RunOptions {
@@ -29,10 +32,14 @@ pub struct RunOptions {
     pub bench: bool,
     /// Windowed 1280x720 instead of fullscreen (development on a desktop).
     pub windowed: bool,
+    pub assets_dir: PathBuf,
+    /// Highest countdown digit to pre-render (`timing.countdown_s`).
+    pub countdown_max: u32,
 }
 
 struct Gfx {
-    // Field order matters: renderer (GL objects) drops before the context.
+    // Field order matters: HUD sprites and renderer (GL objects) drop before the context.
+    hud: Hud,
     renderer: Renderer,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
@@ -41,27 +48,31 @@ struct Gfx {
 
 struct App {
     opts: RunOptions,
-    mailbox: Arc<FrameMailbox>,
+    ctrl: Controller,
     gfx: Option<Gfx>,
     error: Option<anyhow::Error>,
     display_rate: RateMeter,
     upload_rate: RateMeter,
     last_counters: (u64, u64),
+    display_fps: f64,
+    camera_fps: f64,
 }
 
 /// Run the render loop on the calling (main) thread until Esc/q or close.
-pub fn run(mailbox: Arc<FrameMailbox>, opts: RunOptions) -> anyhow::Result<()> {
+pub fn run(ctrl: Controller, opts: RunOptions) -> anyhow::Result<()> {
     let event_loop = EventLoop::new().context("creating event loop")?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let now = Instant::now();
     let mut app = App {
         opts,
-        mailbox,
+        ctrl,
         gfx: None,
         error: None,
         display_rate: RateMeter::new(Duration::from_secs(1), now),
         upload_rate: RateMeter::new(Duration::from_secs(1), now),
         last_counters: (0, 0),
+        display_fps: 0.0,
+        camera_fps: 0.0,
     };
     event_loop.run_app(&mut app).context("event loop")?;
     match app.error {
@@ -109,19 +120,23 @@ impl App {
             })
         };
         let size = window.inner_size();
-        let renderer = unsafe { Renderer::new(gl, (size.width, size.height), self.opts.mirror) }?;
+        let mut renderer = unsafe { Renderer::new(gl, (size.width, size.height), self.opts.mirror) }?;
+        let hud = Hud::new(&mut renderer, &self.opts.assets_dir, self.opts.countdown_max)?;
         tracing::info!(width = size.width, height = size.height, "display ready");
-        Ok(Gfx { renderer, surface, context, window })
+        Ok(Gfx { hud, renderer, surface, context, window })
     }
 
     fn redraw(&mut self) {
+        let now = Instant::now();
+        self.ctrl.update(now);
         let Some(gfx) = self.gfx.as_mut() else { return };
-        if let Some(frame) = self.mailbox.take_latest() {
+        if let Some(frame) = self.ctrl.take_frame() {
             gfx.renderer.upload(&frame);
-            self.mailbox.recycle(frame);
+            self.ctrl.recycle(frame);
             self.upload_rate.tick();
         }
-        gfx.renderer.draw();
+        let overlays = compose(gfx.hud.sprites(), &self.ctrl.scene_input(now, gfx.renderer.screen()));
+        gfx.renderer.draw(&overlays);
         gfx.window.pre_present_notify();
         if let Err(e) = gfx.surface.swap_buffers(&gfx.context) {
             tracing::error!("swap_buffers: {e}");
@@ -130,18 +145,59 @@ impl App {
         self.report();
     }
 
+    /// Once a second: frame-rate figures for `--bench` and the debug overlay.
     fn report(&mut self) {
         let now = Instant::now();
         let Some(display_fps) = self.display_rate.poll(now) else { return };
         let upload_fps = self.upload_rate.poll(now).unwrap_or(0.0);
-        let (published, overwritten) = self.mailbox.counters();
-        let camera_frames = published - self.last_counters.0;
-        let skipped = overwritten - self.last_counters.1;
+        let (published, overwritten) = self.ctrl.camera_counters();
+        // Counters restart from zero when the camera is restarted.
+        let camera_frames = published.saturating_sub(self.last_counters.0);
+        let skipped = overwritten.saturating_sub(self.last_counters.1);
         self.last_counters = (published, overwritten);
+        self.display_fps = display_fps;
+        self.camera_fps = camera_frames as f64;
         if self.opts.bench {
             tracing::info!(display_fps, upload_fps, camera_frames, skipped, "bench");
         } else {
             tracing::debug!(display_fps, upload_fps, camera_frames, skipped, "bench");
+        }
+        self.refresh_debug_text();
+    }
+
+    fn refresh_debug_text(&mut self) {
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        if !self.ctrl.debug {
+            return;
+        }
+        let status = self.ctrl.status();
+        let lines = debug_text(&DebugInfo {
+            display_fps: self.display_fps,
+            camera_fps: self.camera_fps,
+            mirror: gfx.renderer.mirror(),
+            filter: self.ctrl.filter,
+            temp_c: status.temp_c,
+            disk_pct: status.disk_pct,
+        });
+        if let Err(e) = gfx.hud.set_debug_text(&mut gfx.renderer, &lines) {
+            tracing::warn!("debug overlay: {e:#}");
+        }
+    }
+
+    fn on_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        match self.ctrl.on_action(action, Instant::now()) {
+            Some(Action::Quit) => event_loop.exit(),
+            Some(Action::ToggleMirror) => {
+                if let Some(gfx) = self.gfx.as_mut() {
+                    let m = !gfx.renderer.mirror();
+                    gfx.renderer.set_mirror(m);
+                    tracing::info!(mirror = m, "mirror toggled");
+                }
+            }
+            Some(_) | None => {}
+        }
+        if action == Action::ToggleDebug {
+            self.refresh_debug_text();
         }
     }
 }
@@ -174,32 +230,26 @@ impl ApplicationHandler for App {
                 {
                     gfx.surface.resize(&gfx.context, w, h);
                     gfx.renderer.resize((size.width, size.height));
+                    if let Err(e) = gfx.hud.resize(&mut gfx.renderer) {
+                        self.error = Some(e.context("re-rendering the OSD"));
+                        event_loop.exit();
+                    }
                 }
             }
             WindowEvent::KeyboardInput {
-                event: KeyEvent { logical_key, state: ElementState::Pressed, .. }, ..
-            } => match logical_key.as_ref() {
-                Key::Named(NamedKey::Escape) | Key::Character("q") => event_loop.exit(),
-                Key::Character("r") => {
-                    if let Some(gfx) = self.gfx.as_mut() {
-                        let m = !gfx.renderer.mirror();
-                        gfx.renderer.set_mirror(m);
-                        tracing::info!(mirror = m, "mirror toggled");
-                    }
+                event: KeyEvent { logical_key, state: ElementState::Pressed, repeat, .. },
+                ..
+            } => {
+                if let Some(action) = map_key(&logical_key, repeat) {
+                    self.on_action(action, event_loop);
                 }
-                _ => {}
-            },
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(r) = self.mailbox.closed_reason() {
-            self.error = Some(anyhow!("camera stopped: {r}"));
-            event_loop.exit();
-            return;
-        }
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // ControlFlow::Wait does not spin: on Wayland the frame callback
         // scheduled by `pre_present_notify` wakes the loop; on X11 the swap
         // itself waits for vsync. Requesting a redraw keeps frames coming.
