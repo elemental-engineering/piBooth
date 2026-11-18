@@ -5,4 +5,5 @@ pub mod config;
 pub mod display;
 pub mod frame;
 pub mod geometry;
+pub mod state;
 pub mod stats;
