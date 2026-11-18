@@ -19,6 +19,7 @@ glutin = "0.32"
 glutin-winit = "0.5"
 gpiocdev = "0.8"
 libcamera = { version = "0.8", optional = true }
+nix = { version = "0.30", features = ["fs"] }
 raw-window-handle = "0.6"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.2"

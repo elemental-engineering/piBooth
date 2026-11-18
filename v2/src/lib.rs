@@ -6,5 +6,6 @@ pub mod display;
 pub mod frame;
 pub mod geometry;
 pub mod input;
+pub mod monitor;
 pub mod state;
 pub mod stats;
