@@ -58,10 +58,13 @@ impl Camera for PiCamera {
         let running = self.running.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
         let thread = std::thread::Builder::new().name("pi-camera".into()).spawn(move || {
+            let mut guard = CloseGuard { mailbox: mailbox.clone(), running: running.clone(), reason: None };
             if let Err(e) = session(&mailbox, &running, &ready_tx) {
+                let msg = format!("{e:#}");
                 // If setup failed, `start` is still waiting for this message.
-                let _ = ready_tx.send(Err(format!("{e:#}")));
-                tracing::error!("camera session ended: {e:#}");
+                let _ = ready_tx.send(Err(msg.clone()));
+                tracing::error!("camera session ended: {msg}");
+                guard.reason = Some(msg);
             }
         })?;
         self.thread = Some(thread);
@@ -81,7 +84,30 @@ impl Camera for PiCamera {
     fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            if t.join().is_err() {
+                tracing::error!("camera thread panicked");
+            }
+        }
+    }
+}
+
+/// Closes the mailbox when the camera thread ends while it was still meant
+/// to run (session error or panic), so the render loop can fail loudly.
+struct CloseGuard {
+    mailbox: Arc<FrameMailbox>,
+    running: Arc<AtomicBool>,
+    reason: Option<String>,
+}
+
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        if self.running.load(Ordering::SeqCst) {
+            let reason = if std::thread::panicking() {
+                "camera thread panicked".to_string()
+            } else {
+                self.reason.take().unwrap_or_else(|| "camera session ended".to_string())
+            };
+            self.mailbox.close(reason);
         }
     }
 }

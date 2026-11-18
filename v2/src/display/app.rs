@@ -52,7 +52,7 @@ struct App {
 /// Run the render loop on the calling (main) thread until Esc/q or close.
 pub fn run(mailbox: Arc<FrameMailbox>, opts: RunOptions) -> anyhow::Result<()> {
     let event_loop = EventLoop::new().context("creating event loop")?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
     let now = Instant::now();
     let mut app = App {
         opts,
@@ -194,9 +194,15 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Swap blocks on vsync, so requesting continuously paces us at the
-        // display refresh rate without busy-looping.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(r) = self.mailbox.closed_reason() {
+            self.error = Some(anyhow!("camera stopped: {r}"));
+            event_loop.exit();
+            return;
+        }
+        // ControlFlow::Wait does not spin: on Wayland the frame callback
+        // scheduled by `pre_present_notify` wakes the loop; on X11 the swap
+        // itself waits for vsync. Requesting a redraw keeps frames coming.
         if let Some(gfx) = self.gfx.as_ref() {
             gfx.window.request_redraw();
         }

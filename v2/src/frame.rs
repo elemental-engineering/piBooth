@@ -46,6 +46,7 @@ struct Inner {
     spares: Vec<Vec<u8>>,
     published: u64,
     overwritten: u64,
+    closed: Option<String>,
 }
 
 #[derive(Default)]
@@ -93,6 +94,19 @@ impl FrameMailbox {
         }
     }
 
+    /// Mark the producer as gone. The first reason wins.
+    pub fn close(&self, reason: impl Into<String>) {
+        let mut g = self.inner.lock().unwrap();
+        if g.closed.is_none() {
+            g.closed = Some(reason.into());
+        }
+    }
+
+    /// Why the producer stopped, if it did.
+    pub fn closed_reason(&self) -> Option<String> {
+        self.inner.lock().unwrap().closed.clone()
+    }
+
     /// (frames published, frames overwritten before being read)
     pub fn counters(&self) -> (u64, u64) {
         let g = self.inner.lock().unwrap();
@@ -137,6 +151,34 @@ mod tests {
         assert_eq!(mb.take_latest().unwrap().seq, 2);
         assert!(mb.take_latest().is_none());
         assert_eq!(mb.counters(), (2, 1));
+    }
+
+    #[test]
+    fn not_closed_initially() {
+        assert_eq!(FrameMailbox::new().closed_reason(), None);
+    }
+
+    #[test]
+    fn close_sets_reason() {
+        let mb = FrameMailbox::new();
+        mb.close("boom");
+        assert_eq!(mb.closed_reason().as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn first_close_reason_wins() {
+        let mb = FrameMailbox::new();
+        mb.close("first");
+        mb.close("second");
+        assert_eq!(mb.closed_reason().as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn publish_and_take_work_after_close() {
+        let mb = FrameMailbox::new();
+        mb.close("gone");
+        mb.publish(frame(&mb, 7));
+        assert_eq!(mb.take_latest().unwrap().seq, 7);
     }
 
     #[test]

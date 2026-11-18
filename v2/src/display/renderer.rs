@@ -18,7 +18,7 @@ void main() {
 "#;
 
 const FRAGMENT_SHADER: &str = r#"#version 300 es
-precision mediump float;
+precision highp float;
 in vec2 v_uv;
 uniform sampler2D u_tex;
 out vec4 o_color;
@@ -97,6 +97,11 @@ impl Renderer {
 
     /// Upload a new camera frame into the streamed texture.
     pub fn upload(&mut self, frame: &Frame) {
+        assert_eq!(
+            frame.data.len(),
+            Frame::byte_len(frame.width, frame.height),
+            "frame buffer length does not match its size"
+        );
         let gl = &self.gl;
         let size = (frame.width, frame.height);
         unsafe {

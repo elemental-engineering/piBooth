@@ -84,7 +84,9 @@ impl Camera for FakeCamera {
     fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            if t.join().is_err() {
+                tracing::error!("camera thread panicked");
+            }
         }
     }
 }

@@ -1,6 +1,7 @@
 # piBooth v2 configuration. Every key is optional; values shown are defaults.
 # The Immich API key is NOT stored here: set PIBOOTH_IMMICH_API_KEY, or
-# API_KEY in a .env file next to the binary (v1 compatible).
+# API_KEY in a .env file in the working directory (the service sets it to
+# /opt/pibooth) (v1 compatible).
 
 [storage]
 root = "."            # photos/, raw/, queue/ are created under here

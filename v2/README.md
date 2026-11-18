@@ -20,6 +20,7 @@ image's top-left corner; with mirroring on it appears top-right.
 sudo apt install -y libcamera-dev libclang-dev clang pkg-config cage
 pkg-config --modversion libcamera   # must be 0.4.x .. 0.7.x for libcamera crate 0.8
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
 cargo build --release --features libcamera
 ```
 
@@ -29,6 +30,8 @@ Run from a text console (no desktop):
 cage -s -- ./target/release/pibooth --bench
 ```
 
+Check `top` while it runs: pibooth should be well under one full core.
+
 ## Install as a service
 
 ```bash
@@ -36,9 +39,12 @@ sudo useradd -m -G video,render,input,gpio booth
 sudo mkdir -p /opt/pibooth && sudo cp -r target/release/pibooth config.example.toml ../fonts ../effects ../images /opt/pibooth/
 sudo cp /opt/pibooth/config.example.toml /opt/pibooth/config.toml
 sudo chown -R booth: /opt/pibooth
+sudo touch /opt/pibooth/.env && sudo chown booth: /opt/pibooth/.env && sudo chmod 600 /opt/pibooth/.env
 sudo cp deploy/pibooth.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now pibooth
 ```
+
+The `gpio` group exists on Raspberry Pi OS; elsewhere create it first with `sudo groupadd gpio`.
 
 The unit takes over tty1 (it stops `getty@tty1` via `Conflicts=`); use another VT, e.g. Ctrl+Alt+F2, for a console.
 

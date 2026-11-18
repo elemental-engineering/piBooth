@@ -186,7 +186,11 @@ impl Config {
             }
             None => Self::default(),
         };
-        let _ = dotenvy::dotenv();
+        match dotenvy::from_filename(".env") {
+            Ok(_) => {}
+            Err(e) if e.not_found() => {}
+            Err(e) => tracing::warn!("ignoring malformed .env: {e}"),
+        }
         cfg.immich_api_key = api_key_from(|k| std::env::var(k).ok());
         Ok(cfg)
     }

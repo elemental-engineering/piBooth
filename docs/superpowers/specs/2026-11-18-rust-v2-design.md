@@ -349,5 +349,5 @@ CLI: `pibooth [--config PATH] [--fake-camera] [--no-gpio] [--bench]`.
 - Build natively on the Pi (`cargo build --release`) or cross-compile for
   `aarch64-unknown-linux-gnu` with `libcamera-dev` sysroot.
 - System packages: `libcamera-dev`, `cage`, Mesa GLES.
-- systemd unit runs `cage -- /opt/pibooth/pibooth --config /etc/pibooth/config.toml`
+- systemd unit runs `cage -- /opt/pibooth/pibooth --config /opt/pibooth/config.toml`
   with `Restart=always`. Unit file and install notes in `v2/README.md`.
