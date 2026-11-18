@@ -138,7 +138,7 @@ pub fn compose(sprites: &Sprites, input: &SceneInput) -> Vec<Overlay> {
     }
 
     if let Some(n) = input.view.countdown
-        && let Some(d) = sprites.digits.get(n as usize - 1)
+        && let Some(d) = n.checked_sub(1).and_then(|i| sprites.digits.get(i as usize))
     {
         // Centred between ascender and descender (anchor "mm").
         let mid = (d.ascender_y + d.descender_y) / 2;
@@ -214,6 +214,11 @@ mod tests {
     #[test]
     fn out_of_range_digit_is_skipped() {
         assert!(compose(&sprites(), &input(View { countdown: Some(9), ..NONE })).is_empty());
+    }
+
+    #[test]
+    fn zero_digit_is_skipped() {
+        assert!(compose(&sprites(), &input(View { countdown: Some(0), ..NONE })).is_empty());
     }
 
     #[test]
