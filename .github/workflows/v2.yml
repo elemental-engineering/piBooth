@@ -1,0 +1,22 @@
+name: v2
+
+on:
+  push:
+    paths: ["v2/**", ".github/workflows/v2.yml"]
+  pull_request:
+    paths: ["v2/**", ".github/workflows/v2.yml"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: v2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
