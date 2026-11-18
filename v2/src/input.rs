@@ -78,18 +78,27 @@ impl GpioButton {
         let running = Arc::new(AtomicBool::new(true));
         let flag = running.clone();
         let thread = std::thread::Builder::new().name("gpio-button".into()).spawn(move || {
+            let mut read_errors = 0u32;
             while flag.load(Ordering::SeqCst) {
                 match req.wait_edge_event(Duration::from_millis(200)) {
                     Ok(false) => continue,
                     Ok(true) => match req.read_edge_event() {
                         // Rising = inactive→active, already corrected for active_low.
-                        Ok(ev) if ev.kind == gpiocdev::line::EdgeKind::Rising => {
-                            if tx.send(Action::Press).is_err() {
+                        Ok(ev) => {
+                            read_errors = 0;
+                            if ev.kind == gpiocdev::line::EdgeKind::Rising && tx.send(Action::Press).is_err() {
                                 break;
                             }
                         }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!("button read: {e}"),
+                        Err(e) => {
+                            read_errors += 1;
+                            tracing::warn!("button read: {e}");
+                            if read_errors >= 10 {
+                                tracing::error!("button read failed {read_errors} times in a row, button disabled");
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
                     },
                     Err(e) => {
                         tracing::error!("button wait failed, button disabled: {e}");
