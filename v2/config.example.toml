@@ -24,6 +24,7 @@ idle_s = 120
 
 [display]
 mirror_preview = true # preview only; saved photos are never mirrored
+assets_dir = "."      # folder containing fonts/ and images/ (".." when running from v2/)
 
 [filter]
 enabled = true
@@ -38,7 +39,7 @@ active_high = true
 
 [button]
 gpio_line = 27
-active_low = true
+active_low = false    # false: button to 3.3 V, internal pull-down (v1 wiring)
 debounce_ms = 30
 
 [immich]

@@ -84,10 +84,12 @@ impl Default for Timing {
 #[serde(default, deny_unknown_fields)]
 pub struct Display {
     pub mirror_preview: bool,
+    /// Folder holding v1's `fonts/` and `images/`.
+    pub assets_dir: PathBuf,
 }
 impl Default for Display {
     fn default() -> Self {
-        Self { mirror_preview: true }
+        Self { mirror_preview: true, assets_dir: PathBuf::from(".") }
     }
 }
 
@@ -135,7 +137,7 @@ pub struct Button {
 }
 impl Default for Button {
     fn default() -> Self {
-        Self { gpio_line: 27, active_low: true, debounce_ms: 30 }
+        Self { gpio_line: 27, active_low: false, debounce_ms: 30 }
     }
 }
 
@@ -254,6 +256,18 @@ mod tests {
     fn example_config_parses() {
         let text = include_str!("../config.example.toml");
         Config::from_toml_str(text).unwrap();
+    }
+
+    #[test]
+    fn dev_config_points_assets_at_repo_root() {
+        let cfg = Config::from_toml_str(include_str!("../config.dev.toml")).unwrap();
+        assert_eq!(cfg.display.assets_dir, PathBuf::from(".."));
+    }
+
+    #[test]
+    fn button_defaults_match_v1_wiring() {
+        let b = Config::default().button;
+        assert_eq!((b.gpio_line, b.active_low, b.debounce_ms), (27, false, 30));
     }
 
     #[test]

@@ -1,0 +1,4 @@
+# Development settings. From v2/:
+#   cargo run -- --config config.dev.toml --fake-camera --windowed --no-gpio
+[display]
+assets_dir = ".."   # v1 fonts/ and images/ live at the repo root
