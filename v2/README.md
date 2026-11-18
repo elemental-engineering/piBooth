@@ -40,5 +40,7 @@ sudo cp deploy/pibooth.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now pibooth
 ```
 
+The unit takes over tty1 (it stops `getty@tty1` via `Conflicts=`); use another VT, e.g. Ctrl+Alt+F2, for a console.
+
 The Immich key goes in `/opt/pibooth/.env` as `PIBOOTH_IMMICH_API_KEY=...`
 (or v1's `API_KEY=...`).

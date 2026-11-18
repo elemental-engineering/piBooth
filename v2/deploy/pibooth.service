@@ -1,12 +1,18 @@
 [Unit]
 Description=piBooth photo booth (v2)
-After=network-online.target systemd-user-sessions.service
+After=network-online.target systemd-user-sessions.service getty@tty1.service
 Wants=network-online.target
+Conflicts=getty@tty1.service
 
 [Service]
 User=booth
 PAMName=login
 TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
 WorkingDirectory=/opt/pibooth
 Environment=RUST_LOG=info
 EnvironmentFile=-/opt/pibooth/.env
