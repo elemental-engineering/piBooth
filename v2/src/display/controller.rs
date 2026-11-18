@@ -17,6 +17,10 @@ use crate::state::{Booth, Command, Event, Timings};
 pub type CameraFactory = Box<dyn FnMut() -> Box<dyn Camera>>;
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A camera that publishes no frame for this long counts as lost (spec §5).
+const STALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// A restarted camera must stream this long before the backoff resets.
+const HEALTHY_AFTER: Duration = Duration::from_secs(5);
 
 /// State-machine timings from the configuration.
 pub fn timings_from(cfg: &Config) -> Timings {
@@ -38,6 +42,9 @@ pub struct Controller {
     mailbox: Arc<FrameMailbox>,
     backoff: Backoff,
     restart_at: Option<Instant>,
+    last_published: u64,
+    last_progress: Instant,
+    healthy_since: Option<Instant>,
     monitors: Monitors,
     _button: Option<GpioButton>,
     button_rx: Receiver<Action>,
@@ -69,6 +76,9 @@ impl Controller {
             mailbox,
             backoff: Backoff::new(Duration::from_secs(1), Duration::from_secs(30)),
             restart_at: None,
+            last_published: 0,
+            last_progress: now,
+            healthy_since: None,
             monitors: Monitors::start(cfg)?,
             _button: button,
             button_rx,
@@ -82,6 +92,10 @@ impl Controller {
     /// (`Quit`, `ToggleMirror`) for the caller.
     pub fn on_action(&mut self, action: Action, now: Instant) -> Option<Action> {
         match action {
+            Action::Press if self.camera.is_none() => {
+                tracing::debug!("press ignored: camera is down");
+                None
+            }
             Action::Press => {
                 let cmds = self.booth.handle(Event::Press, now);
                 self.apply(cmds, now);
@@ -158,17 +172,38 @@ impl Controller {
     }
 
     fn supervise_camera(&mut self, now: Instant) {
-        if self.camera.is_some()
-            && let Some(reason) = self.mailbox.closed_reason()
-        {
-            tracing::error!("camera stopped: {reason}");
-            if let Some(mut cam) = self.camera.take() {
-                cam.stop();
+        if self.camera.is_some() {
+            let published = self.mailbox.counters().0;
+            if published > self.last_published {
+                self.last_published = published;
+                self.last_progress = now;
             }
-            let cmds = self.booth.handle(Event::CameraLost, now);
-            self.apply(cmds, now);
-            self.restart_at = Some(now + self.backoff.next_delay());
+            let lost = if let Some(reason) = self.mailbox.closed_reason() {
+                Some(reason.to_string())
+            } else if now.saturating_duration_since(self.last_progress) >= STALL_TIMEOUT {
+                Some("no camera frames for 3 s".to_string())
+            } else {
+                None
+            };
+            if let Some(reason) = lost {
+                tracing::error!("camera stopped: {reason}");
+                if let Some(mut cam) = self.camera.take() {
+                    cam.stop();
+                }
+                self.healthy_since = None;
+                let cmds = self.booth.handle(Event::CameraLost, now);
+                self.apply(cmds, now);
+                self.restart_at = Some(now + self.backoff.next_delay());
+            } else if let Some(since) = self.healthy_since
+                && self.last_published > 0
+                && now.saturating_duration_since(since) >= HEALTHY_AFTER
+            {
+                self.backoff.reset();
+                self.healthy_since = None;
+            }
         }
+        // Runs on the render thread and can block (PiCamera start takes up to
+        // 10 s); moving it off-thread is planned with milestone 3.
         if self.camera.is_none() && self.restart_at.is_some_and(|t| now >= t) {
             let mailbox = FrameMailbox::new();
             let mut cam = (self.make_camera)();
@@ -177,8 +212,10 @@ impl Controller {
                     tracing::info!("camera restarted");
                     self.mailbox = mailbox;
                     self.camera = Some(cam);
-                    self.backoff.reset();
                     self.restart_at = None;
+                    self.healthy_since = Some(now);
+                    self.last_published = 0;
+                    self.last_progress = now;
                 }
                 Err(e) => {
                     let delay = self.backoff.next_delay();
@@ -253,17 +290,24 @@ mod tests {
     fn button_press_runs_a_full_shot_and_freezes_preview() {
         let (mut c, tx) = controller(Arc::new(AtomicUsize::new(0)), false);
         let t0 = Instant::now();
+        wait_for_frame(&c.mailbox);
         tx.send(Action::Press).unwrap();
         c.update(t0);
         assert!(matches!(c.booth.phase(), Phase::Countdown { .. }));
         assert!(c.scene_input(t0, (100, 100)).view.countdown.is_some());
+        // Virtual time jumps: let real frames arrive so the watchdog sees progress.
+        std::thread::sleep(Duration::from_millis(30));
         c.update(t0 + Duration::from_millis(4800));
         assert!(c.scene_input(t0 + Duration::from_millis(4800), (100, 100)).view.flash);
+        // Virtual time jumps: let real frames arrive so the watchdog sees progress.
+        std::thread::sleep(Duration::from_millis(30));
         c.update(t0 + Duration::from_secs(5));
         assert!(matches!(c.booth.phase(), Phase::Review { .. }));
         assert!(c.frozen);
         std::thread::sleep(Duration::from_millis(50));
         assert!(c.take_frame().is_none(), "frozen preview yields no frames");
+        // Virtual time jumps: let real frames arrive so the watchdog sees progress.
+        std::thread::sleep(Duration::from_millis(30));
         c.update(t0 + Duration::from_secs(10));
         assert_eq!(c.booth.phase(), Phase::Live);
         std::thread::sleep(Duration::from_millis(50));
@@ -299,6 +343,78 @@ mod tests {
         assert!(!c.scene_input(t0, (100, 100)).banner);
         std::thread::sleep(Duration::from_millis(50));
         assert!(c.take_frame().is_some(), "new camera streams into the new mailbox");
+    }
+
+    /// Wait (real time) until the camera behind `mailbox` has published a frame.
+    fn wait_for_frame(mailbox: &FrameMailbox) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while mailbox.counters().0 == 0 {
+            assert!(Instant::now() < deadline, "camera never published");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Starts fine but never publishes, like a hung sensor.
+    struct SilentCamera;
+
+    impl Camera for SilentCamera {
+        fn start(&mut self, _mailbox: Arc<FrameMailbox>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) {}
+    }
+
+    #[test]
+    fn stalled_camera_is_restarted() {
+        let t0 = Instant::now();
+        let (_tx, rx) = mpsc::channel();
+        let factory: CameraFactory = Box::new(|| Box::new(SilentCamera));
+        let mut c = Controller::start(&cfg(), factory, None, rx, t0).unwrap();
+        c.update(t0 + Duration::from_millis(2900));
+        assert!(!c.scene_input(t0, (100, 100)).banner, "not stalled yet");
+        c.update(t0 + Duration::from_secs(3));
+        assert!(c.scene_input(t0, (100, 100)).banner);
+        assert_eq!(c.booth.phase(), Phase::Idle);
+    }
+
+    #[test]
+    fn backoff_resets_only_after_healthy_period() {
+        let t0 = Instant::now();
+        let (_tx, rx) = mpsc::channel();
+        let factory: CameraFactory = Box::new(|| Box::new(FakeCamera::new((8, 8), 100)));
+        let mut c = Controller::start(&cfg(), factory, None, rx, t0).unwrap();
+        wait_for_frame(&c.mailbox);
+        c.mailbox.close("sensor gone");
+        c.update(t0);
+        c.update(t0 + Duration::from_secs(1));
+        assert!(c.camera.is_some(), "restarted after 1 s");
+        wait_for_frame(&c.mailbox);
+        // Dies again well before the 5 s healthy period: the delay doubles.
+        c.update(t0 + Duration::from_secs(2));
+        c.mailbox.close("sensor gone again");
+        c.update(t0 + Duration::from_secs(2));
+        assert_eq!(c.restart_at, Some(t0 + Duration::from_secs(4)), "next delay is 2 s, not 1 s");
+        // A restart that then runs for 5 s resets the backoff.
+        c.update(t0 + Duration::from_secs(4));
+        wait_for_frame(&c.mailbox);
+        // Frames keep arriving (real time passes between the virtual updates).
+        for secs in [5, 7, 9] {
+            std::thread::sleep(Duration::from_millis(50));
+            c.update(t0 + Duration::from_secs(secs));
+        }
+        c.mailbox.close("sensor gone a third time");
+        c.update(t0 + Duration::from_secs(9));
+        assert_eq!(c.restart_at, Some(t0 + Duration::from_secs(10)), "healthy run reset the delay to 1 s");
+    }
+
+    #[test]
+    fn press_ignored_while_camera_down() {
+        let (mut c, _tx) = controller(Arc::new(AtomicUsize::new(0)), false);
+        let t0 = Instant::now();
+        c.mailbox.close("sensor gone");
+        c.update(t0);
+        assert_eq!(c.on_action(Action::Press, t0), None);
+        assert_eq!(c.booth.phase(), Phase::Idle);
     }
 
     #[test]
