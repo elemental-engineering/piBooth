@@ -207,6 +207,15 @@ impl Config {
         if self.timing.countdown_s == 0 {
             bail!("timing.countdown_s must be >= 1");
         }
+        if self.timing.countdown_s > 30 {
+            bail!("timing.countdown_s must be <= 30");
+        }
+        if self.flash.lead_ms > self.flash.max_ms {
+            bail!("flash.lead_ms must be <= flash.max_ms");
+        }
+        if self.flash.lead_ms as u64 >= self.timing.countdown_s as u64 * 1000 {
+            bail!("flash.lead_ms must be shorter than the countdown (timing.countdown_s)");
+        }
         if self.button.gpio_line == self.flash.gpio_line && self.flash.mode == FlashMode::Strobe {
             bail!("button.gpio_line and flash.gpio_line must differ");
         }
@@ -280,6 +289,9 @@ mod tests {
         assert!(Config::from_toml_str("[capture]\nburst_frames = 0\n").is_err());
         assert!(Config::from_toml_str("[capture]\njpeg_quality = 0\n").is_err());
         assert!(Config::from_toml_str("[flash]\nmode = \"strobe\"\ngpio_line = 27\n").is_err());
+        assert!(Config::from_toml_str("[flash]\nlead_ms = 900\nmax_ms = 800\n").is_err());
+        assert!(Config::from_toml_str("[timing]\ncountdown_s = 1\n[flash]\nlead_ms = 1000\n").is_err());
+        assert!(Config::from_toml_str("[timing]\ncountdown_s = 31\n").is_err());
     }
 
     #[test]
