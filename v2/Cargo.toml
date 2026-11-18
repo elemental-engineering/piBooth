@@ -14,6 +14,7 @@ libcamera = ["dep:libcamera"]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
 dotenvy = "0.15"
+fontdue = "0.9"
 glow = "0.18"
 glutin = "0.32"
 glutin-winit = "0.5"
