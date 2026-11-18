@@ -1,0 +1,18 @@
+[Unit]
+Description=piBooth photo booth (v2)
+After=network-online.target systemd-user-sessions.service
+Wants=network-online.target
+
+[Service]
+User=booth
+PAMName=login
+TTYPath=/dev/tty1
+WorkingDirectory=/opt/pibooth
+Environment=RUST_LOG=info
+EnvironmentFile=-/opt/pibooth/.env
+ExecStart=/usr/bin/cage -s -- /opt/pibooth/pibooth --config /opt/pibooth/config.toml
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
