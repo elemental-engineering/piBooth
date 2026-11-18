@@ -2,17 +2,29 @@
 
 Rewrite of the Python booth (`../main.py`). Design: `../docs/superpowers/specs/2026-11-18-rust-v2-design.md`.
 
-Status: milestone 1 — live preview at sensor rate. No capture yet.
+Status: milestone 2 — live preview, button and countdown, screen flash, on-screen
+display, status icons and camera auto-restart. The "photo" is still the frozen
+preview frame and is not saved (capture arrives in milestone 3).
 
 ## Develop on a laptop (no Pi needed)
 
 ```bash
 cargo test
-cargo run -- --fake-camera --windowed --bench
+cargo run -- --config config.dev.toml --fake-camera --windowed --no-gpio --bench
 ```
 
-Keys: `Esc`/`q` quit, `r` toggle preview mirror. The red square marks the
-image's top-left corner; with mirroring on it appears top-right.
+`config.dev.toml` points `display.assets_dir` at the repo root, where v1's
+`fonts/` and `images/` live.
+
+Keys: `Space` take a photo, `d` debug overlay, `r` mirror preview, `f` filter
+on/off, `Esc`/`q` quit. The red square marks the image's top-left corner; with
+mirroring on it appears top-right.
+
+## Button
+
+Same wiring as v1: a push button between GPIO 27 (BCM) and 3.3 V. v2 enables
+the internal pull-down and listens for debounced press edges. For a button to
+ground instead, set `[button] active_low = true` (internal pull-up).
 
 ## Build on the Raspberry Pi 5
 
@@ -24,10 +36,11 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 cargo build --release --features libcamera
 ```
 
-Run from a text console (no desktop):
+Run from a text console (no desktop), from the repo root so `fonts/` and
+`images/` are found:
 
 ```bash
-cage -s -- ./target/release/pibooth --bench
+cd .. && NO_COLOR=1 cage -s -- v2/target/release/pibooth --bench > bench.log 2>&1
 ```
 
 Check `top` while it runs: pibooth should be well under one full core.

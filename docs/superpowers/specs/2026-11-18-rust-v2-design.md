@@ -88,8 +88,8 @@ replaces it).
 ```
 
 Threads: main (winit event loop + GL render + state machine), camera
-(libcamera callbacks), a rayon pool for the pipeline, a tokio runtime (2
-workers) for upload and monitors, and a GPIO event thread. Communication is
+(libcamera callbacks), a rayon pool for the pipeline, plain threads for the
+monitors and the GPIO button (milestone 2), and a tokio runtime for upload (milestone 4). Communication is
 by `crossbeam-channel` messages; the only shared memory is the preview frame
 triple buffer and an `Arc<AtomicStatus>`-style status snapshot.
 
@@ -98,17 +98,17 @@ triple buffer and an `Arc<AtomicStatus>`-style status snapshot.
 | Module | Responsibility | Depends on |
 |---|---|---|
 | `config` | Load `config.toml` + env (`PIBOOTH_IMMICH_API_KEY` or `.env`); validate; defaults | serde, toml, dotenvy |
-| `state` | Pure `BoothState` machine driven by events and an injected `Clock` | none |
+| `state` | Pure booth state machine | none |
 | `geometry` | Letterbox rect, OSD layout in normalised units | none |
 | `camera` | `Camera` trait; `LibcameraCamera` and `FakeCamera` (test pattern) | libcamera |
 | `display` | winit window (fullscreen), glutin/glow GL context, shaders, textures, draw | winit, glutin, glow |
-| `osd` | Pre-rasterised text (fontdue) and icons into RGBA atlases | fontdue, image |
+| `osd` | Text/icon rasterisation and scene layout, no GL | fontdue, image |
 | `input` | `Button` trait; `GpioButton` (gpiocdev) and keyboard mapping → `InputEvent` | gpiocdev |
-| `flash` | `Flash` trait; `ScreenFlash`, `GpioStrobe` | gpiocdev |
+| `flash` | `Flash` trait; `ScreenFlash`, `GpioStrobe` (milestone 5; the screen flash is a view flag until then) | gpiocdev |
 | `pipeline` | Align + average burst, sharpest-frame pick, sepia, effect composite, encode, EXIF, DNG | rayon, image, turbojpeg, little_exif |
 | `storage` | Filenames, directory creation, disk usage (statvfs) | nix |
 | `upload` | Persistent queue, Immich client, retries | tokio, reqwest |
-| `monitor` | CPU temp, disk %, Immich reachability → `StatusUpdate` | tokio, reqwest |
+| `monitor` | CPU temp, disk %, Immich reachability → `StatusUpdate` | std threads, nix (statvfs) |
 | `app` | Wires everything; owns the render loop | all |
 
 Crate versions are pinned in `Cargo.toml` at scaffold time; libcamera-rs
@@ -141,7 +141,7 @@ Idle ──press──► Countdown{deadline} ──deadline──► Capturing 
   does not retrigger.
 
 Maintenance keys (keyboard): `Esc`/`q` quit, `Space` = press, `d` debug OSD,
-`r` mirror preview toggle, `f` filter toggle, `b` bench overlay.
+`r` mirror preview toggle, `f` filter toggle. Key auto-repeat is ignored; `Q` works like `q`.
 
 ### 4.2 Camera
 
@@ -225,13 +225,13 @@ Input: N full-res RGB frames (+ optional raw). Steps, on the rayon pool:
 
 ### 4.7 Monitors
 
-On tokio, each publishing `StatusUpdate` to the main thread:
+On their own threads, each updating a shared `Status` snapshot read by the render loop:
 
 | Monitor | Interval | Warning | Critical | Source |
 |---|---|---|---|---|
 | CPU temp | 1 s | > 60 °C | ≥ 65 °C | `/sys/class/thermal/thermal_zone0/temp` |
 | Disk | 5 min + after each save | > 70 % | ≥ 90 % | statvfs on `storage.root` |
-| Network | 60 s (10 s while offline) | — | unreachable | `GET {server_root}`, 5 s timeout |
+| Network | 60 s (10 s while offline) | — | unreachable | TCP connect to the `immich.base_url` host:port, 5 s timeout |
 
 Thresholds and intervals are configurable. Icons: `images/*.png` as in v1.
 
@@ -261,6 +261,7 @@ idle_s = 120
 
 [display]
 mirror_preview = true
+assets_dir = "."
 
 [filter]
 enabled = true
@@ -275,7 +276,7 @@ active_high = true
 
 [button]
 gpio_line = 27
-active_low = true
+active_low = false   # v1 wiring: button to 3.3 V, pull-down
 debounce_ms = 30
 
 [immich]
