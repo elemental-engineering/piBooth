@@ -49,7 +49,7 @@ the Raspberry Pi Global Shutter Camera.
 | `main.py:333,343,347` | Save and upload commented out | Always save; upload via queue |
 | `main.py:44` | Crash if `photos/` missing | Create output dirs at startup |
 | `main.py:219` | gpiod v1 API vs pinned v2; hard-coded `gpiochip4` | `gpiocdev`, line looked up by name/offset across chips |
-| `main.py:379` | Level-polled button, no debounce/pull | Edge events, debounce, bias pull-up, configurable active level |
+| `main.py:379` | Level-polled button, no debounce/pull | Edge events, debounce, bias matching the configured active level (default active-high + pull-down, v1 wiring) |
 | `main.py:132,436` | Blocking HTTP without timeout in render loop | Async tasks with timeouts; render never awaits I/O |
 | `main.py:175` | Letterbox by pixel deltas (overflow on small screens) | Scale = min(w ratio, h ratio) |
 | `main.py:279,336` | Saved image mirrored | Mirror only in the preview shader |
@@ -79,7 +79,7 @@ replaces it).
    ┌──────┴────────▼────────┐             │
    │     BoothState machine │◄────────────┘
    └──────▲────────▲────────┘
-  InputEvent│      │StatusUpdate          ┌──────────────┐
+  InputEvent│      │Status                ┌──────────────┐
    ┌────────┴──┐ ┌─┴──────────┐  enqueue  │ upload task  │
    │ input     │ │ monitors   │ ─────────►│ (tokio, disk │
    │ GPIO/keys │ │ temp/disk/ │           │  queue)      │
@@ -90,8 +90,8 @@ replaces it).
 Threads: main (winit event loop + GL render + state machine), camera
 (libcamera callbacks), a rayon pool for the pipeline, plain threads for the
 monitors and the GPIO button (milestone 2), and a tokio runtime for upload (milestone 4). Communication is
-by `crossbeam-channel` messages; the only shared memory is the preview frame
-triple buffer and an `Arc<AtomicStatus>`-style status snapshot.
+by `std::sync::mpsc` messages; the only shared memory is the preview frame
+triple buffer and a `Mutex<Status>` status snapshot.
 
 ### 3.1 Modules
 
@@ -108,7 +108,7 @@ triple buffer and an `Arc<AtomicStatus>`-style status snapshot.
 | `pipeline` | Align + average burst, sharpest-frame pick, sepia, effect composite, encode, EXIF, DNG | rayon, image, turbojpeg, little_exif |
 | `storage` | Filenames, directory creation, disk usage (statvfs) | nix |
 | `upload` | Persistent queue, Immich client, retries | tokio, reqwest |
-| `monitor` | CPU temp, disk %, Immich reachability → `StatusUpdate` | std threads, nix (statvfs) |
+| `monitor` | CPU temp, disk %, Immich reachability → `Status` snapshot | std threads, nix (statvfs) |
 | `app` | Wires everything; owns the render loop | all |
 
 Crate versions are pinned in `Cargo.toml` at scaffold time; libcamera-rs
@@ -302,7 +302,7 @@ CLI: `pibooth [--config PATH] [--fake-camera] [--no-gpio] [--bench]`.
 
 - Startup: config errors, missing fonts/effects, or camera not found → log and
   exit non-zero (systemd restarts). Missing GPIO → warning, keyboard-only.
-- Runtime camera error (request failure, sensor drop) → OSD error banner,
+- Runtime camera error (request failure, sensor drop, or no frames for 3 s) → OSD error banner,
   camera restart with backoff; state returns to `Idle`.
 - Pipeline failure on a capture → log, show "Oops, try again" during review,
   keep any original already written.
