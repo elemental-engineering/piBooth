@@ -15,12 +15,14 @@ anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.6", features = ["derive"] }
 dotenvy = "0.15"
+fastrand = "2"
 fontdue = "0.9"
 glow = "0.18"
 glutin = "0.32"
 glutin-winit = "0.5"
 gpiocdev = "0.8"
 image = { version = "0.25", default-features = false, features = ["png"] }
+jpeg-encoder = "0.7"
 libcamera = { version = "0.8", optional = true }
 nix = { version = "0.30", features = ["fs"] }
 raw-window-handle = "0.6"
@@ -31,6 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 winit = "0.30"
 
 [dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 kamadak-exif = "0.6"
 tempfile = "3"
 

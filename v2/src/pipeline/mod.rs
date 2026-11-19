@@ -2,3 +2,5 @@
 
 pub mod exif;
 pub mod filters;
+pub mod photo;
+pub mod worker;
