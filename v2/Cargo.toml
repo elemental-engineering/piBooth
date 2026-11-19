@@ -32,6 +32,7 @@ winit = "0.30"
 [dev-dependencies]
 tempfile = "3"
 
+# Default codegen settings on purpose: LTO with codegen-units = 1 needs more
+# RAM than a 4 GB Pi 5 has for the final crates and froze native builds.
+# The app is GPU/camera-bound, so the extra optimisation buys nothing visible.
 [profile.release]
-lto = "thin"
-codegen-units = 1

@@ -33,7 +33,16 @@ sudo apt install -y libcamera-dev libclang-dev clang pkg-config cage
 pkg-config --modversion libcamera   # must be 0.4.x .. 0.7.x for libcamera crate 0.8
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
-cargo build --release --features libcamera
+cargo build --release --features libcamera -j 2
+```
+
+On a 4 GB Pi, give the build some swap first (Raspberry Pi OS ships 200 MB),
+and close the desktop/browser while it compiles:
+
+```bash
+sudo dphys-swapfile swapoff
+sudo sed -i 's/^#\?CONF_SWAPSIZE=.*/CONF_SWAPSIZE=2048/' /etc/dphys-swapfile
+sudo dphys-swapfile setup && sudo dphys-swapfile swapon
 ```
 
 Run from a text console (no desktop), from the repo root so `fonts/` and
