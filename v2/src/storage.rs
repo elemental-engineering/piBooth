@@ -26,6 +26,8 @@ impl Storage {
 
     /// Paths for a shot taken at `taken`: (photo, original). A second shot in
     /// the same second gets a `_2`, `_3`, … suffix instead of overwriting.
+    /// Single writer only: the photo worker is the sole caller, so the
+    /// exists-check and the later write cannot race.
     pub fn paths_for(&self, taken: NaiveDateTime) -> (PathBuf, PathBuf) {
         let stem = format!("booth_{}", taken.format("%Y%m%d-%H%M%S"));
         for n in 1.. {
@@ -50,8 +52,20 @@ impl Storage {
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let tmp = path.with_extension("jpg.part");
     let mut f = std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    f.write_all(bytes).and_then(|_| f.sync_all()).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
+    let result = f
+        .write_all(bytes)
+        .and_then(|_| f.sync_all())
+        .with_context(|| format!("writing {}", tmp.display()))
+        .and_then(|_| std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display())));
+    if let Err(e) = result {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp); // best effort: don't leave a stray .part
+        return Err(e);
+    }
+    // Persist the rename itself; not supported everywhere, so ignore failures.
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    }
     Ok(())
 }
 
@@ -97,6 +111,15 @@ mod tests {
             std::fs::read_dir(dir.path().join("photos")).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names.len(), 1, "no .part file left: {names:?}");
         assert_eq!(s.photo_count(), 1);
+    }
+
+    #[test]
+    fn failed_rename_leaves_no_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("x.jpg");
+        std::fs::create_dir(&target).unwrap(); // rename file -> directory fails
+        assert!(write_atomic(&target, b"jpeg").is_err());
+        assert!(!dir.path().join("x.jpg.part").exists(), "temp file cleaned up");
     }
 
     #[test]

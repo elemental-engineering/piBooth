@@ -43,7 +43,8 @@ pub fn to_rgba(rgb: &[u8], width: u32, height: u32) -> Rgba {
     Rgba { width, height, data }
 }
 
-/// Every `*.png` in `dir`, sorted by name, resized to `size` if needed.
+/// Every decodable `*.png` in `dir`, sorted by name, resized to `size` if
+/// needed. Unreadable PNGs are skipped with a warning; an unreadable folder errors.
 pub fn load_effects(dir: &Path, size: (u32, u32)) -> anyhow::Result<Vec<Rgba>> {
     let mut files: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("reading effects folder {}", dir.display()))?
@@ -52,18 +53,24 @@ pub fn load_effects(dir: &Path, size: (u32, u32)) -> anyhow::Result<Vec<Rgba>> {
         .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")))
         .collect();
     files.sort();
-    files
+    Ok(files
         .iter()
-        .map(|p| {
-            let img = image::open(p).with_context(|| format!("loading effect {}", p.display()))?.to_rgba8();
+        .filter_map(|p| {
+            let img = match image::open(p) {
+                Ok(img) => img.to_rgba8(),
+                Err(e) => {
+                    tracing::warn!("skipping unreadable effect {}: {e}", p.display());
+                    return None;
+                }
+            };
             let img = if img.dimensions() == size {
                 img
             } else {
                 image::imageops::resize(&img, size.0, size.1, FilterType::Lanczos3)
             };
-            Ok(Rgba { width: size.0, height: size.1, data: img.into_raw() })
+            Some(Rgba { width: size.0, height: size.1, data: img.into_raw() })
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -113,5 +120,14 @@ mod tests {
         let small = load_effects(dir, (64, 48)).unwrap();
         assert_eq!(small[0].data.len(), 64 * 48 * 4, "resized when sizes differ");
         assert!(load_effects(Path::new("/nonexistent"), (1, 1)).is_err());
+    }
+
+    #[test]
+    fn undecodable_png_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 4])).save(dir.path().join("a.png")).unwrap();
+        std::fs::write(dir.path().join("b.png"), b"not a png").unwrap();
+        let effects = load_effects(dir.path(), (2, 2)).unwrap();
+        assert_eq!(effects.len(), 1);
     }
 }
