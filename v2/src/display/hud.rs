@@ -17,6 +17,7 @@ const RED: [u8; 4] = [255, 0, 0, 255];
 pub const TITLE: &str = "Photo Shoot";
 pub const SUBTITLE: &str = "Press to start";
 pub const CAMERA_ERROR: &str = "Camera problem, restarting…";
+pub const OOPS: &str = "Oops, try again";
 
 pub struct Hud {
     assets_dir: PathBuf,
@@ -59,6 +60,21 @@ impl Hud {
         self.sprites = build(r, &self.assets, screen, self.countdown_max)?;
         self.screen = screen;
         self.debug_text.clear();
+        Ok(())
+    }
+
+    /// Show `image` as the review photo (re-uses one GPU texture).
+    pub fn set_photo(&mut self, r: &mut Renderer, image: &Rgba) -> anyhow::Result<()> {
+        match self.sprites.photo {
+            Some((id, _, _)) => r.update_sprite(id, image),
+            None => {
+                let id = r.create_sprite(image)?;
+                self.sprites.photo = Some((id, image.width, image.height));
+            }
+        }
+        if let Some(p) = self.sprites.photo.as_mut() {
+            (p.1, p.2) = (image.width, image.height);
+        }
         Ok(())
     }
 
@@ -118,13 +134,15 @@ fn build(r: &mut Renderer, a: &Assets, screen: (u32, u32), countdown_max: u32) -
         .map(|n| text(&a.title_font, &n.to_string(), style(1000.0, scale, CREAM, true)))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let banner = text(&a.text_font, CAMERA_ERROR, style(48.0, scale, WHITE, false))?;
+    let oops = text(&a.title_font, OOPS, style(160.0, scale, CREAM, true))?;
     let white = r.create_sprite(&Rgba { width: 1, height: 1, data: vec![255; 4] })?;
     let icons = a.icons.iter().map(|img| r.create_sprite(img)).collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(Sprites { white, title, subtitle, digits, banner, icons, debug_lines: Vec::new() })
+    Ok(Sprites { white, title, subtitle, digits, banner, oops, icons, debug_lines: Vec::new(), photo: None })
 }
 
 fn all_ids(s: &Sprites) -> Vec<SpriteId> {
-    let mut ids = vec![s.white, s.title.id, s.subtitle.id, s.banner.id];
+    let mut ids = vec![s.white, s.title.id, s.subtitle.id, s.banner.id, s.oops.id];
+    ids.extend(s.photo.map(|(id, _, _)| id));
     ids.extend(s.digits.iter().map(|d| d.id));
     ids.extend(s.icons.iter().copied());
     ids.extend(s.debug_lines.iter().map(|d| d.id));

@@ -130,6 +130,11 @@ impl App {
         let now = Instant::now();
         self.ctrl.update(now);
         let Some(gfx) = self.gfx.as_mut() else { return };
+        if let Some(photo) = self.ctrl.take_review_image()
+            && let Err(e) = gfx.hud.set_photo(&mut gfx.renderer, &photo)
+        {
+            tracing::error!("showing review photo: {e:#}");
+        }
         if let Some(frame) = self.ctrl.take_frame() {
             gfx.renderer.upload(&frame);
             self.ctrl.recycle(frame);
@@ -178,6 +183,7 @@ impl App {
             filter: self.ctrl.filter,
             temp_c: status.temp_c,
             disk_pct: status.disk_pct,
+            photo_count: self.ctrl.photo_count(),
         });
         if let Err(e) = gfx.hud.set_debug_text(&mut gfx.renderer, &lines) {
             tracing::warn!("debug overlay: {e:#}");

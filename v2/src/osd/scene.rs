@@ -1,12 +1,13 @@
 //! Pure layout: given the booth view, status and pre-rendered sprites,
 //! decide which overlays to draw and where (v1 positions, scaled to the
-//! screen). Draw order: icons, debug text, title, countdown, banner, flash.
+//! screen). Draw order: review photo, icons, debug text, title, countdown,
+//! "oops" message, camera banner, flash.
 
 use super::assets::Icon;
 use super::{Overlay, SpriteId, WHITE};
-use crate::geometry::Rect;
+use crate::geometry::{Rect, letterbox};
 use crate::monitor::{Level, Network, Status};
-use crate::state::View;
+use crate::state::{Outcome, View};
 
 /// A rendered text sprite and its vertical metrics (see `TextImage`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,9 +29,13 @@ pub struct Sprites {
     /// `digits[n - 1]` shows the number `n`.
     pub digits: Vec<TextSprite>,
     pub banner: TextSprite,
+    /// "Oops, try again" (shown when a photo failed).
+    pub oops: TextSprite,
     /// Indexed like [`Icon::ALL`]; all `icon_px` square.
     pub icons: Vec<SpriteId>,
     pub debug_lines: Vec<TextSprite>,
+    /// The last processed photo and its size, shown during review.
+    pub photo: Option<(SpriteId, u32, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,6 +77,7 @@ pub struct DebugInfo {
     pub filter: bool,
     pub temp_c: Option<f32>,
     pub disk_pct: Option<f32>,
+    pub photo_count: usize,
 }
 
 /// Debug overlay lines, top to bottom (v1's list plus camera fps).
@@ -80,6 +86,7 @@ pub fn debug_text(d: &DebugInfo) -> Vec<String> {
     vec![
         format!("fps: {:.0}", d.display_fps),
         format!("Camera fps: {:.0}", d.camera_fps),
+        format!("Photo count: {}", d.photo_count),
         format!("Mirrored: {}", d.mirror),
         format!("Filtered: {}", d.filter),
         format!("Temperature: {}", opt(d.temp_c, "°C")),
@@ -105,11 +112,32 @@ fn text_at(t: &TextSprite, x: i32, y: i32) -> Overlay {
     Overlay { sprite: t.id, rect: Rect { x, y, w: t.w, h: t.h }, tint: WHITE }
 }
 
+/// `t` with its top-left at (`cx - w/2`, `y`) on a translucent dark box.
+fn boxed_text(sprites: &Sprites, t: &TextSprite, cx: i32, y: i32, scale: f32) -> [Overlay; 2] {
+    let pad = (20.0 * scale) as i32;
+    let x = cx - t.w as i32 / 2;
+    [
+        Overlay {
+            sprite: sprites.white,
+            rect: Rect { x: x - pad, y: y - pad, w: t.w + 2 * pad as u32, h: t.h + 2 * pad as u32 },
+            tint: [0.0, 0.0, 0.0, 0.65],
+        },
+        text_at(t, x, y),
+    ]
+}
+
 pub fn compose(sprites: &Sprites, input: &SceneInput) -> Vec<Overlay> {
     let (sw, sh) = input.screen;
     let m = Metrics::for_screen(input.screen);
     let (cx, cy) = ((sw / 2) as i32, (sh / 2) as i32);
     let mut out = Vec::new();
+
+    if input.view.review == Some(Outcome::Photo)
+        && let Some((id, w, h)) = sprites.photo
+    {
+        // The saved photo, letterboxed like the preview but never mirrored.
+        out.push(Overlay { sprite: id, rect: letterbox((w, h), input.screen), tint: WHITE });
+    }
 
     for (i, icon) in visible_icons(&input.status).into_iter().enumerate() {
         let idx = Icon::ALL.iter().position(|a| *a == icon).unwrap();
@@ -145,17 +173,13 @@ pub fn compose(sprites: &Sprites, input: &SceneInput) -> Vec<Overlay> {
         out.push(text_at(d, cx - d.w as i32 / 2, cy - mid));
     }
 
+    if input.view.review == Some(Outcome::Oops) {
+        out.extend(boxed_text(sprites, &sprites.oops, cx, cy - sprites.oops.h as i32 / 2, m.scale));
+    }
+
     if input.banner {
-        let b = &sprites.banner;
-        let pad = (20.0 * m.scale) as i32;
         let y = sh as i32 - (sh as f32 * 0.15) as i32;
-        let x = cx - b.w as i32 / 2;
-        out.push(Overlay {
-            sprite: sprites.white,
-            rect: Rect { x: x - pad, y: y - pad, w: b.w + 2 * pad as u32, h: b.h + 2 * pad as u32 },
-            tint: [0.0, 0.0, 0.0, 0.65],
-        });
-        out.push(text_at(b, x, y));
+        out.extend(boxed_text(sprites, &sprites.banner, cx, y, m.scale));
     }
 
     if input.view.flash {
@@ -179,8 +203,10 @@ mod tests {
             subtitle: ts(2, 600, 140),
             digits: (1..=5).map(|n| ts(10 + n, 500, 1000)).collect(),
             banner: ts(3, 700, 60),
+            oops: ts(4, 900, 160),
             icons: (20..25).map(SpriteId).collect(),
             debug_lines: vec![ts(30, 150, 24), ts(31, 200, 24)],
+            photo: Some((SpriteId(40), 1456, 1088)),
         }
     }
 
@@ -269,18 +295,47 @@ mod tests {
             filter: false,
             temp_c: Some(48.31),
             disk_pct: None,
+            photo_count: 12,
         };
         assert_eq!(
             debug_text(&d),
             vec![
                 "fps: 60",
                 "Camera fps: 60",
+                "Photo count: 12",
                 "Mirrored: true",
                 "Filtered: false",
                 "Temperature: 48.3°C",
                 "Disk used: --"
             ]
         );
+    }
+
+    #[test]
+    fn review_shows_photo_letterboxed_and_unmirrored_first() {
+        let mut i = input(View { review: Some(Outcome::Photo), ..NONE });
+        i.status = Status { temp: Level::Warning, ..Status::default() };
+        let out = compose(&sprites(), &i);
+        assert_eq!(out[0].sprite, SpriteId(40), "photo under the icons");
+        assert_eq!(out[0].rect, Rect { x: 237, y: 0, w: 1445, h: 1080 });
+        assert_eq!(out[0].tint, WHITE);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn review_without_photo_sprite_draws_nothing() {
+        let mut s = sprites();
+        s.photo = None;
+        assert!(compose(&s, &input(View { review: Some(Outcome::Photo), ..NONE })).is_empty());
+    }
+
+    #[test]
+    fn oops_is_centred_on_a_dark_box() {
+        let out = compose(&sprites(), &input(View { review: Some(Outcome::Oops), ..NONE }));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].tint, [0.0, 0.0, 0.0, 0.65]);
+        assert_eq!(out[1].sprite, SpriteId(4));
+        assert_eq!(out[1].rect, Rect { x: 960 - 450, y: 540 - 80, w: 900, h: 160 });
     }
 
     #[test]
