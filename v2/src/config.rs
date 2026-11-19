@@ -210,6 +210,13 @@ impl Config {
         if self.timing.countdown_s > 30 {
             bail!("timing.countdown_s must be <= 30");
         }
+        if self.flash.lead_ms < 100 {
+            bail!("flash.lead_ms must be at least 100 ms so high-quality noise reduction reaches the photo");
+        }
+        let (lat, lon) = (self.immich.latitude, self.immich.longitude);
+        if !lat.is_finite() || !lon.is_finite() || lat.abs() > 90.0 || lon.abs() > 180.0 {
+            bail!("immich.latitude must be within +-90 and immich.longitude within +-180");
+        }
         if self.flash.lead_ms > self.flash.max_ms {
             bail!("flash.lead_ms must be <= flash.max_ms");
         }
@@ -292,6 +299,10 @@ mod tests {
         assert!(Config::from_toml_str("[flash]\nlead_ms = 900\nmax_ms = 800\n").is_err());
         assert!(Config::from_toml_str("[timing]\ncountdown_s = 1\n[flash]\nlead_ms = 1000\n").is_err());
         assert!(Config::from_toml_str("[timing]\ncountdown_s = 31\n").is_err());
+        assert!(Config::from_toml_str("[flash]\nlead_ms = 99\n").is_err());
+        assert!(Config::from_toml_str("[immich]\nlatitude = nan\n").is_err());
+        assert!(Config::from_toml_str("[immich]\nlatitude = 90.5\n").is_err());
+        assert!(Config::from_toml_str("[immich]\nlongitude = -180.5\n").is_err());
     }
 
     #[test]

@@ -24,6 +24,7 @@ const SHORT: u16 = 3;
 const LONG: u16 = 4;
 const RATIONAL: u16 = 5;
 const BYTE: u16 = 1;
+const UNDEFINED: u16 = 7;
 
 struct Entry {
     tag: u16,
@@ -51,13 +52,13 @@ fn rationals(tag: u16, values: &[(u32, u32)]) -> Entry {
     Entry { tag, kind: RATIONAL, count: values.len() as u32, data }
 }
 
-/// Degrees → (deg, min, sec×1000/1000) rationals.
+/// Degrees → (deg, min, sec×1000/1000) rationals. Works on an integer count
+/// of thousandths of an arc-second so seconds never round up to 60.000.
 fn dms(value: f64) -> [(u32, u32); 3] {
-    let v = value.abs();
-    let deg = v.trunc();
-    let min_f = (v - deg) * 60.0;
-    let min = min_f.trunc();
-    let sec_milli = ((min_f - min) * 60.0 * 1000.0).round();
+    let total = (value.abs() * 3600.0 * 1000.0).round() as u64;
+    let deg = total / 3_600_000;
+    let min = total % 3_600_000 / 60_000;
+    let sec_milli = total % 60_000;
     [(deg as u32, 1), (min as u32, 1), (sec_milli as u32, 1000)]
 }
 
@@ -101,7 +102,11 @@ fn ifd_len(entries: &[Entry]) -> u32 {
 pub fn build(info: &PhotoInfo) -> Vec<u8> {
     let stamp = info.taken.format("%Y:%m:%d %H:%M:%S").to_string();
 
-    let mut exif = vec![ascii(0x9003, &stamp), ascii(0x9004, &stamp)];
+    let mut exif = vec![
+        Entry { tag: 0x9000, kind: UNDEFINED, count: 4, data: b"0232".to_vec() }, // ExifVersion
+        ascii(0x9003, &stamp),
+        ascii(0x9004, &stamp),
+    ];
     if let Some(us) = info.exposure_us.filter(|us| *us > 0) {
         exif.push(rationals(0x829A, &[(us as u32, 1_000_000)]));
     }
@@ -179,6 +184,7 @@ mod tests {
         assert_eq!(text(&e, Tag::Model), "\"Global Shutter Camera (IMX296)\"");
         assert_eq!(text(&e, Tag::DateTimeOriginal), "2026-11-19 14:03:07");
         assert_eq!(text(&e, Tag::DateTime), "2026-11-19 14:03:07");
+        assert_eq!(text(&e, Tag::DateTimeDigitized), "2026-11-19 14:03:07");
         assert_eq!(e.get_field(Tag::Orientation, In::PRIMARY).unwrap().value.get_uint(0), Some(1));
     }
 
@@ -213,5 +219,20 @@ mod tests {
         assert!(e.get_field(Tag::PhotographicSensitivity, In::PRIMARY).is_none());
         assert!(e.get_field(Tag::GPSLatitude, In::PRIMARY).is_none());
         assert!(e.get_field(Tag::DateTimeOriginal, In::PRIMARY).is_some());
+    }
+
+    #[test]
+    fn exif_version_is_present() {
+        let e = parse(build(&info()));
+        match &e.get_field(Tag::ExifVersion, In::PRIMARY).unwrap().value {
+            Value::Undefined(v, _) => assert_eq!(v, b"0232"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn dms_carries_instead_of_reaching_sixty_seconds() {
+        assert_eq!(dms(10.999_999_999), [(11, 1), (0, 1), (0, 1000)]);
+        assert_eq!(dms(48.858_37), [(48, 1), (51, 1), (30_132, 1000)]);
     }
 }
