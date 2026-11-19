@@ -2,9 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
+use std::sync::Arc;
 use std::time::Instant;
 
-use pibooth::camera::{SENSOR_FPS, SENSOR_SIZE, fake::FakeCamera};
+use pibooth::camera::{Camera, SENSOR_FPS, SENSOR_SIZE, fake::FakeCamera};
 use pibooth::config::Config;
 use pibooth::display::{self, CameraFactory, Controller, RunOptions};
 use pibooth::input::GpioButton;
@@ -66,12 +67,12 @@ fn main() -> anyhow::Result<()> {
 
 fn camera_factory(cli: &Cli, cfg: &Config) -> anyhow::Result<CameraFactory> {
     if cli.fake_camera {
-        return Ok(Box::new(|| Box::new(FakeCamera::new(SENSOR_SIZE, SENSOR_FPS))));
+        return Ok(Arc::new(|| -> Box<dyn Camera> { Box::new(FakeCamera::new(SENSOR_SIZE, SENSOR_FPS)) }));
     }
     #[cfg(feature = "libcamera")]
     {
         let cam_cfg = cfg.camera.clone();
-        Ok(Box::new(move || Box::new(pibooth::camera::pi::PiCamera::new(cam_cfg.clone()))))
+        Ok(Arc::new(move || -> Box<dyn Camera> { Box::new(pibooth::camera::pi::PiCamera::new(cam_cfg.clone())) }))
     }
     #[cfg(not(feature = "libcamera"))]
     {

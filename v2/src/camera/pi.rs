@@ -14,7 +14,10 @@ use anyhow::{Context, anyhow, bail};
 use libcamera::camera::CameraConfigurationStatus;
 use libcamera::camera_manager::CameraManager;
 use libcamera::control::ControlList;
-use libcamera::controls::{AnalogueGain, ExposureTime, FrameDuration, FrameDurationLimits, SensorTimestamp};
+use libcamera::controls::{
+    AnalogueGain, AnalogueGainMode, AwbEnable, ExposureTime, ExposureTimeMode, FrameDuration, FrameDurationLimits,
+    NoiseReductionMode, SensorTimestamp,
+};
 use libcamera::framebuffer::AsFrameBuffer;
 use libcamera::framebuffer_allocator::{FrameBuffer, FrameBufferAllocator};
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
@@ -23,7 +26,7 @@ use libcamera::pixel_format::PixelFormat;
 use libcamera::request::{RequestStatus, ReuseFlag};
 use libcamera::stream::StreamRole;
 
-use super::{Camera, SENSOR_FPS, SENSOR_SIZE};
+use super::{Camera, CameraCommand, CameraLink, CaptureMeta, CapturedFrame, SENSOR_FPS, SENSOR_SIZE};
 use crate::config::CameraCfg;
 use crate::frame::{Frame, FrameMailbox, copy_packed};
 use crate::stats::{FrameSample, FrameTiming};
@@ -37,16 +40,17 @@ pub struct PiCamera {
     cfg: CameraCfg,
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    commands: Option<mpsc::Sender<CameraCommand>>,
 }
 
 impl PiCamera {
     pub fn new(cfg: CameraCfg) -> Self {
-        Self { cfg, running: Arc::new(AtomicBool::new(false)), thread: None }
+        Self { cfg, running: Arc::new(AtomicBool::new(false)), thread: None, commands: None }
     }
 }
 
 impl Camera for PiCamera {
-    fn start(&mut self, mailbox: Arc<FrameMailbox>) -> anyhow::Result<()> {
+    fn start(&mut self, link: CameraLink) -> anyhow::Result<()> {
         if self.thread.is_some() {
             return Ok(());
         }
@@ -58,9 +62,11 @@ impl Camera for PiCamera {
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        self.commands = Some(cmd_tx);
         let thread = std::thread::Builder::new().name("pi-camera".into()).spawn(move || {
-            let mut guard = CloseGuard { mailbox: mailbox.clone(), running: running.clone(), reason: None };
-            if let Err(e) = session(&mailbox, &running, &ready_tx) {
+            let mut guard = CloseGuard { mailbox: link.mailbox.clone(), running: running.clone(), reason: None };
+            if let Err(e) = session(&link, &cmd_rx, &running, &ready_tx) {
                 let msg = format!("{e:#}");
                 // If setup failed, `start` is still waiting for this message.
                 let _ = ready_tx.send(Err(msg.clone()));
@@ -82,8 +88,15 @@ impl Camera for PiCamera {
         }
     }
 
+    fn command(&mut self, cmd: CameraCommand) {
+        if let Some(tx) = &self.commands {
+            let _ = tx.send(cmd);
+        }
+    }
+
     fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        self.commands = None;
         if let Some(t) = self.thread.take()
             && t.join().is_err()
         {
@@ -119,11 +132,61 @@ impl Drop for PiCamera {
     }
 }
 
+/// Control changes waiting for the next re-queued request. libcamera keeps
+/// controls once set, so each change is sent once.
+#[derive(Debug, Default, PartialEq)]
+struct PendingControls {
+    noise_reduction: Option<NoiseReductionMode>,
+    /// `Some(true)`: freeze exposure, gain and white balance at their current
+    /// values (switching to manual keeps the last computed value).
+    /// `Some(false)`: back to automatic.
+    lock: Option<bool>,
+}
+
+impl PendingControls {
+    fn on_command(&mut self, cmd: CameraCommand) {
+        match cmd {
+            CameraCommand::PrepareCapture => self.noise_reduction = Some(NoiseReductionMode::HighQuality),
+            CameraCommand::Capture { .. } => self.lock = Some(true),
+            CameraCommand::ReleaseCapture => {
+                self.noise_reduction = Some(NoiseReductionMode::Fast);
+                self.lock = Some(false);
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn apply(&mut self, list: &mut ControlList) -> anyhow::Result<()> {
+        fn err(name: &'static str) -> impl Fn(libcamera::control::ControlError) -> anyhow::Error {
+            move |e| anyhow!("{name}: {e:?}")
+        }
+        if let Some(nr) = self.noise_reduction.take() {
+            list.set(nr).map_err(err("NoiseReductionMode"))?;
+        }
+        if let Some(lock) = self.lock.take() {
+            let (exposure, gain) = if lock {
+                (ExposureTimeMode::Manual, AnalogueGainMode::Manual)
+            } else {
+                (ExposureTimeMode::Auto, AnalogueGainMode::Auto)
+            };
+            list.set(exposure).map_err(err("ExposureTimeMode"))?;
+            list.set(gain).map_err(err("AnalogueGainMode"))?;
+            list.set(AwbEnable(!lock)).map_err(err("AwbEnable"))?;
+        }
+        Ok(())
+    }
+}
+
 fn session(
-    mailbox: &FrameMailbox,
+    link: &CameraLink,
+    commands: &mpsc::Receiver<CameraCommand>,
     running: &AtomicBool,
     ready: &mpsc::Sender<Result<(), String>>,
 ) -> anyhow::Result<()> {
+    let mailbox = &link.mailbox;
     let mgr = CameraManager::new().context("starting libcamera")?;
     let cameras = mgr.cameras();
     let cam = cameras.get(0).ok_or_else(|| anyhow!("no camera found (is the ribbon cable seated?)"))?;
@@ -186,7 +249,16 @@ fn session(
     let row_bytes = w as usize * 3;
     let mut timing = FrameTiming::default();
     let mut last_report = Instant::now();
+    let mut pending = PendingControls::default();
+    let mut capture: Option<u64> = None;
     while running.load(Ordering::SeqCst) {
+        for cmd in commands.try_iter() {
+            tracing::debug!(?cmd, "camera command");
+            pending.on_command(cmd);
+            if let CameraCommand::Capture { id } = cmd {
+                capture = Some(id);
+            }
+        }
         let mut req = match done_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(r) => r,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -204,8 +276,19 @@ fn session(
             let mut data = mailbox.take_buffer(Frame::byte_len(w, h));
             copy_packed(planes[0], stride, row_bytes, h as usize, &mut data);
             let copy_us = copy_start.elapsed().as_micros() as u64;
-            mailbox.publish(Frame { width: w, height: h, data, seq, captured_at: Instant::now() });
             let md = req.metadata();
+            if let Some(id) = capture.take() {
+                // The next complete frame after the command: high-quality noise
+                // reduction has been on since PrepareCapture (~300 ms earlier).
+                let meta = CaptureMeta {
+                    exposure_us: md.get::<ExposureTime>().ok().map(|v| v.0),
+                    gain: md.get::<AnalogueGain>().ok().map(|v| v.0),
+                };
+                tracing::info!(id, seq, exposure_us = meta.exposure_us, gain = meta.gain, "frame captured");
+                let frame = Frame { width: w, height: h, data: data.clone(), seq, captured_at: Instant::now() };
+                let _ = link.captures.send(CapturedFrame { id, frame, meta });
+            }
+            mailbox.publish(Frame { width: w, height: h, data, seq, captured_at: Instant::now() });
             timing.record(FrameSample {
                 seq,
                 sensor_ts_ns: md.get::<SensorTimestamp>().ok().map(|v| v.0),
@@ -232,6 +315,9 @@ fn session(
             );
         }
         req.reuse(ReuseFlag::REUSE_BUFFERS);
+        if !pending.is_empty() {
+            pending.apply(req.controls_mut())?;
+        }
         cam.queue_request(req).map_err(|(_, e)| e).context("re-queueing request")?;
     }
     cam.stop().context("stopping camera")?;

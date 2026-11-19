@@ -109,6 +109,8 @@ pub fn reachable(host: &str, port: u16, timeout: Duration) -> bool {
 pub struct Monitors {
     status: Arc<Mutex<Status>>,
     running: Arc<AtomicBool>,
+    /// Set to re-check disk usage on the next pass (after a photo is saved).
+    disk_now: Arc<AtomicBool>,
     /// The local-checks thread; joined on drop (it wakes every 100 ms).
     local: Option<JoinHandle<()>>,
 }
@@ -117,9 +119,11 @@ impl Monitors {
     pub fn start(cfg: &Config) -> anyhow::Result<Self> {
         let status = Arc::new(Mutex::new(Status::default()));
         let running = Arc::new(AtomicBool::new(true));
+        let disk_now = Arc::new(AtomicBool::new(false));
         let (st, run, mon, root) = (status.clone(), running.clone(), cfg.monitor.clone(), cfg.storage.root.clone());
+        let dn = disk_now.clone();
         let local = std::thread::Builder::new().name("monitor".into()).spawn(move || {
-            local_loop(&st, &run, &mon, &root);
+            local_loop(&st, &run, &dn, &mon, &root);
         })?;
 
         if let Some((host, port)) = server_addr(&cfg.immich.base_url) {
@@ -132,11 +136,16 @@ impl Monitors {
         } else if !cfg.immich.base_url.is_empty() {
             tracing::warn!(url = %cfg.immich.base_url, "cannot parse immich.base_url; network check disabled");
         }
-        Ok(Self { status, running, local: Some(local) })
+        Ok(Self { status, running, disk_now, local: Some(local) })
     }
 
     pub fn snapshot(&self) -> Status {
         *self.status.lock().unwrap()
+    }
+
+    /// Re-check disk usage within about a second (spec §4.7: after each save).
+    pub fn recheck_disk(&self) {
+        self.disk_now.store(true, Ordering::SeqCst);
     }
 }
 
@@ -162,11 +171,17 @@ fn nap(running: &AtomicBool, d: Duration) -> bool {
     false
 }
 
-fn local_loop(status: &Mutex<Status>, running: &AtomicBool, mon: &crate::config::Monitor, root: &Path) {
+fn local_loop(
+    status: &Mutex<Status>,
+    running: &AtomicBool,
+    disk_now: &AtomicBool,
+    mon: &crate::config::Monitor,
+    root: &Path,
+) {
     let mut next_disk = Instant::now();
     loop {
         let temp_c = std::fs::read_to_string(TEMP_PATH).ok().and_then(|t| parse_millidegrees(&t));
-        let disk = if Instant::now() >= next_disk {
+        let disk = if disk_now.swap(false, Ordering::SeqCst) || Instant::now() >= next_disk {
             next_disk = Instant::now() + DISK_INTERVAL;
             match disk_used_pct(root) {
                 Ok(p) => Some(p),
@@ -270,5 +285,24 @@ mod tests {
         let s = m.snapshot();
         assert!(s.disk_pct.is_some());
         assert_eq!(s.network, Network::Disabled);
+    }
+
+    #[test]
+    fn recheck_disk_refreshes_within_a_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.storage.root = dir.path().to_path_buf();
+        let m = Monitors::start(&cfg).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while m.snapshot().disk_pct.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        m.status.lock().unwrap().disk_pct = None; // forget the first reading
+        m.recheck_disk();
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while m.snapshot().disk_pct.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(m.snapshot().disk_pct.is_some(), "re-checked before the 5 min interval");
     }
 }

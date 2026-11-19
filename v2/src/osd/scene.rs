@@ -188,7 +188,7 @@ mod tests {
         SceneInput { screen: (1920, 1080), view, status: Status::default(), debug: false, banner: false }
     }
 
-    const NONE: View = View { title: false, countdown: None, flash: false };
+    const NONE: View = View { title: false, countdown: None, flash: false, review: None };
 
     #[test]
     fn plain_live_view_draws_nothing() {

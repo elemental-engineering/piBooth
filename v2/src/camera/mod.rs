@@ -2,8 +2,9 @@
 //! preview frames into a [`FrameMailbox`].
 
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 
-use crate::frame::FrameMailbox;
+use crate::frame::{Frame, FrameMailbox};
 
 pub mod fake;
 
@@ -41,10 +42,48 @@ impl Backoff {
     }
 }
 
-pub trait Camera {
+/// Capture-related requests from the booth to the camera thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraCommand {
+    /// Switch to high-quality noise reduction; auto-exposure keeps metering.
+    PrepareCapture,
+    /// Lock exposure and white balance, and deliver the next complete frame
+    /// as capture `id` (full resolution, never mirrored).
+    Capture { id: u64 },
+    /// Back to preview settings: auto exposure/white balance, fast noise reduction.
+    ReleaseCapture,
+}
+
+/// Exposure settings the frame was taken with (for EXIF).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CaptureMeta {
+    pub exposure_us: Option<i32>,
+    pub gain: Option<f32>,
+}
+
+#[derive(Debug)]
+pub struct CapturedFrame {
+    pub id: u64,
+    pub frame: Frame,
+    pub meta: CaptureMeta,
+}
+
+/// Where a running camera sends its output.
+pub struct CameraLink {
+    /// Latest preview frame (overwritten, never blocks the camera).
+    pub mailbox: Arc<FrameMailbox>,
+    /// Captured frames, one per `Capture` command.
+    pub captures: Sender<CapturedFrame>,
+}
+
+/// A camera runs its own thread. It is `Send` so it can be started and
+/// stopped off the render thread.
+pub trait Camera: Send {
     /// Start streaming. Returns once the camera thread is running; errors
     /// that happen during setup are returned here.
-    fn start(&mut self, mailbox: Arc<FrameMailbox>) -> anyhow::Result<()>;
+    fn start(&mut self, link: CameraLink) -> anyhow::Result<()>;
+    /// Queue a capture command; ignored if the camera is not running.
+    fn command(&mut self, cmd: CameraCommand);
     /// Stop streaming and join the camera thread. Idempotent.
     fn stop(&mut self);
 }

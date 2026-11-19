@@ -23,7 +23,7 @@ glutin-winit = "0.5"
 gpiocdev = "0.8"
 image = { version = "0.25", default-features = false, features = ["png"] }
 jpeg-encoder = "0.7"
-libcamera = { version = "0.8", optional = true }
+libcamera = { version = "0.8", optional = true, features = ["vendor_draft"] }
 nix = { version = "0.30", features = ["fs"] }
 raw-window-handle = "0.6"
 serde = { version = "1.0", features = ["derive"] }
