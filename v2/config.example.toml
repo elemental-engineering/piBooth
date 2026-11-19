@@ -11,6 +11,7 @@ save_original = true  # keep the unfiltered photo in raw/
 tuning_file = ""      # empty = libcamera default (imx296.json)
 
 [capture]
+# Milestone 3 uses one frame per photo; burst_frames/stack/save_dng arrive in milestone 5.
 burst_frames = 6
 stack = "average"     # average | sharpest | off
 max_shift_px = 8
@@ -24,7 +25,7 @@ idle_s = 120
 
 [display]
 mirror_preview = true # preview only; saved photos are never mirrored
-assets_dir = "."      # folder containing fonts/ and images/ (".." when running from v2/)
+assets_dir = "."      # folder containing fonts/, images/ and effects/ (".." when running from v2/)
 
 [filter]
 enabled = true

@@ -2,9 +2,24 @@
 
 Rewrite of the Python booth (`../main.py`). Design: `../docs/superpowers/specs/2026-11-18-rust-v2-design.md`.
 
-Status: milestone 2 — live preview, button and countdown, screen flash, on-screen
-display, status icons and camera auto-restart. The "photo" is still the frozen
-preview frame and is not saved (capture arrives in milestone 3).
+Status: milestone 3 — live preview, button and countdown, screen flash,
+full-quality capture (high-quality noise reduction, exposure and white balance
+locked for the shot), sepia + effect overlay, JPEG with EXIF, review of the
+saved photo, status icons and camera auto-restart. Upload to Immich arrives in
+milestone 4.
+
+## Photos
+
+Every shot is saved under `storage.root` (default: the working directory):
+
+- `photos/booth_YYYYMMDD-HHMMSS.jpg` — the finished photo (sepia + a random
+  overlay from `effects/` when the filter is on, plain otherwise).
+- `raw/booth_YYYYMMDD-HHMMSS.jpg` — the unfiltered original
+  (`storage.save_original = true`).
+
+Photos are never mirrored, are 1456×1088 (the sensor's full resolution), JPEG
+quality `capture.jpeg_quality` (95) with full colour detail, and carry EXIF date,
+camera, exposure, ISO and — when `immich.latitude`/`longitude` are set — GPS.
 
 ## Develop on a laptop (no Pi needed)
 
@@ -14,10 +29,11 @@ cargo run -- --config config.dev.toml --fake-camera --windowed --no-gpio --bench
 ```
 
 `config.dev.toml` points `display.assets_dir` at the repo root, where v1's
-`fonts/` and `images/` live.
+`fonts/`, `images/` and `effects/` live. Photos taken while developing land in
+`v2/photos/` and `v2/raw/`.
 
-Keys: `Space` take a photo, `d` debug overlay, `r` mirror preview, `f` filter
-on/off, `Esc`/`q` quit. The red square marks the image's top-left corner; with
+Keys: `Space` take a photo, `d` debug overlay (includes the photo count), `r`
+mirror preview, `f` filter on/off for the next photos, `Esc`/`q` quit. The red square marks the image's top-left corner; with
 mirroring on it appears top-right.
 
 ## Button
@@ -30,7 +46,7 @@ ground instead, set `[button] active_low = true` (internal pull-up).
 
 ```bash
 sudo apt install -y libcamera-dev libclang-dev clang pkg-config cage
-pkg-config --modversion libcamera   # must be 0.4.x .. 0.7.x for libcamera crate 0.8
+pkg-config --modversion libcamera   # must be 0.5.x .. 0.7.x for libcamera crate 0.8 (the Pi ships 0.5.2)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
 cargo build --release --features libcamera -j 2

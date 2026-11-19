@@ -105,8 +105,8 @@ triple buffer and a `Mutex<Status>` status snapshot.
 | `osd` | Text/icon rasterisation and scene layout, no GL | fontdue, image |
 | `input` | `Button` trait; `GpioButton` (gpiocdev) and keyboard mapping → `InputEvent` | gpiocdev |
 | `flash` | `Flash` trait; `ScreenFlash`, `GpioStrobe` (milestone 5; the screen flash is a view flag until then) | gpiocdev |
-| `pipeline` | Align + average burst, sharpest-frame pick, sepia, effect composite, encode, EXIF, DNG | rayon, image, turbojpeg, little_exif |
-| `storage` | Filenames, directory creation, disk usage (statvfs) | nix |
+| `pipeline` | Align + average burst, sharpest-frame pick, sepia, effect composite, encode, EXIF, DNG | image, jpeg-encoder, fastrand; EXIF via an in-crate TIFF writer (rayon arrives with stacking in milestone 5) |
+| `storage` | Photo folders, v1 file names, atomic writes | chrono |
 | `upload` | Persistent queue, Immich client, retries | tokio, reqwest |
 | `monitor` | CPU temp, disk %, Immich reachability → `Status` snapshot | std threads, nix (statvfs) |
 | `app` | Wires everything; owns the render loop | all |
@@ -119,7 +119,7 @@ viability is verified in milestone 1 (see §7 Risks).
 ### 4.1 State machine
 
 ```
-Idle ──press──► Countdown{deadline} ──deadline──► Capturing ──burst done──► Review{until}
+Idle ──press──► Countdown{deadline} ──deadline──► Capturing ──frame──► Processing ──photo──► Review{until}
  ▲                    │                                                       │
  └──── idle_timeout ─ Live ◄───────────────────── review_timeout ─────────────┘
                       └──press──► Countdown
@@ -134,6 +134,8 @@ Idle ──press──► Countdown{deadline} ──deadline──► Capturing 
   request a capture burst.
 - `Capturing`: preview continues (screen flash stays white until burst
   complete or `flash.max_ms`). Presses ignored.
+- `Processing`: the photo worker filters, encodes and saves; preview continues. Failure or a 10 s timeout ⇒ review shows "Oops, try again".
+- Every capture has an id; results for another id are ignored.
 - `Review`: shows the processed photo for `review_timeout_s` (default 5).
   Presses ignored. The pipeline delivers a preview-resolution image first so
   review starts without waiting for JPEG/DNG encoding.
@@ -145,15 +147,8 @@ Maintenance keys (keyboard): `Esc`/`q` quit, `Space` = press, `d` debug OSD,
 
 ### 4.2 Camera
 
-- Configuration: two streams from the Pi 5 ISP.
-  - Preview: RGB888 at 1456×1088 (sensor native; the GPU scales to 1445×1080
-    letterboxed on 1080p), frame duration fixed at sensor max (~16.6 ms).
-  - Capture: full-res RGB888 with `NoiseReductionMode = HighQuality`, plus the
-    raw Bayer stream when `capture.save_dng = true`.
-- AE/AWB: metered during countdown (with the screen flash on when
-  `flash.mode = "screen"`, so the lock matches the lit scene), then locked
-  (`AeEnable=false`, `AwbEnable=false` with the converged exposure/gain/colour
-  gains applied manually) for the burst; unlocked on entering `Review`.
+- Configuration: One BGR888 stream at 1456×1088 — the sensor's native size — serves preview and capture. ≈`flash.lead_ms` before the shot `PrepareCapture` sets `NoiseReductionMode = HighQuality`; the photo is the next complete frame after `Capture`. A raw Bayer stream is added in milestone 5 when `capture.save_dng = true`.
+- AE/AWB: AE/AWB meter during the lead (with the screen flash on in screen mode), then lock at `Capture` by switching `ExposureTimeMode` and `AnalogueGainMode` to Manual and `AwbEnable = false` (libcamera keeps the last computed values); `ReleaseCapture` (once the frame arrives) restores Auto and Fast noise reduction.
 - Burst: `capture.burst_frames` (default 6) consecutive frames at 60 fps
   (~100 ms). With global shutter no rolling distortion exists, so alignment is
   translation-only.
@@ -192,11 +187,8 @@ Input: N full-res RGB frames (+ optional raw). Steps, on the rayon pool:
    clamped to 255 (no max normalisation).
 4. **Effect**: a random PNG from `effects/`, resized once at startup to the
    capture size (Lanczos), alpha-composited.
-5. **Encode**: JPEG quality 95, 4:4:4, with EXIF `DateTimeOriginal`, `Make`/
-   `Model`, and GPS lat/long when configured → `photos/booth_<ts>.jpg`.
-   Write to a temp file and rename for atomicity.
-6. Emit `PhotoSaved { path, preview_rgba }` to the state machine and enqueue
-   upload.
+5. **Encode**: JPEG quality `capture.jpeg_quality` (95), 4:4:4, pure-Rust `jpeg-encoder`, with EXIF Make/Model/Orientation/DateTimeOriginal/ExposureTime/ISO and GPS when configured → `photos/booth_<ts>.jpg`; `_2`, `_3`… for same-second shots; temp file + rename.
+6. Return the review image (the saved photo as RGBA) and re-check disk usage; upload is enqueued in milestone 4.
 
 ### 4.5 Flash
 
