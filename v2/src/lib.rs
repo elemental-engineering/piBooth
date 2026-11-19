@@ -8,5 +8,6 @@ pub mod geometry;
 pub mod input;
 pub mod monitor;
 pub mod osd;
+pub mod pipeline;
 pub mod state;
 pub mod stats;

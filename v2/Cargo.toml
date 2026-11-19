@@ -12,6 +12,7 @@ libcamera = ["dep:libcamera"]
 
 [dependencies]
 anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.6", features = ["derive"] }
 dotenvy = "0.15"
 fontdue = "0.9"
@@ -30,6 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 winit = "0.30"
 
 [dev-dependencies]
+kamadak-exif = "0.6"
 tempfile = "3"
 
 # Default codegen settings on purpose: LTO with codegen-units = 1 needs more
