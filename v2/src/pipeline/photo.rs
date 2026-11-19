@@ -73,7 +73,16 @@ pub fn process(
         sepia(&mut job.rgb);
         if !effects.is_empty() {
             let i = pick(effects.len()).min(effects.len() - 1);
-            composite(&mut job.rgb, &effects[i]);
+            let effect = &effects[i];
+            if (effect.width, effect.height) == (job.width, job.height) {
+                composite(&mut job.rgb, effect);
+            } else {
+                tracing::warn!(
+                    effect = ?(effect.width, effect.height),
+                    frame = ?(job.width, job.height),
+                    "effect size differs from frame; overlay skipped"
+                );
+            }
         }
         encode_jpeg(&job.rgb, job.width, job.height, job.jpeg_quality, &exif)?
     } else {
@@ -168,6 +177,14 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path().join("raw")).unwrap().count(), 0);
         let px = decode(&done.photo).get_pixel(0, 8).0;
         assert!(px[0] > 180 && px[2] < 70, "no sepia, no effect: {px:?}");
+    }
+
+    #[test]
+    fn mismatched_effect_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::create(dir.path()).unwrap();
+        let done = process(job(true, false), &storage, &[effect(8, 8)], |_| 0).unwrap();
+        assert!(done.photo.exists());
     }
 
     #[test]

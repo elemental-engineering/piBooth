@@ -27,7 +27,18 @@ impl Worker {
             for job in job_rx {
                 let id = job.id;
                 let started = std::time::Instant::now();
-                let outcome = process(job, &storage, &effects, |n| fastrand::usize(..n)).map_err(|e| format!("{e:#}"));
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    process(job, &storage, &effects, |n| fastrand::usize(..n))
+                }))
+                .unwrap_or_else(|payload| {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    Err(anyhow::anyhow!("photo processing panicked: {msg}"))
+                })
+                .map_err(|e| format!("{e:#}"));
                 match &outcome {
                     Ok(d) => tracing::info!(id, photo = %d.photo.display(), ms = started.elapsed().as_millis() as u64, "photo saved"),
                     Err(e) => tracing::error!(id, "photo failed: {e}"),
@@ -118,5 +129,24 @@ mod tests {
         let r = wait(&w);
         assert_eq!(r.id, 3);
         assert!(r.outcome.unwrap_err().contains("photos"));
+    }
+
+    fn effect_8x4() -> Rgba {
+        Rgba { width: 8, height: 4, data: vec![255; 8 * 4 * 4] }
+    }
+
+    #[test]
+    fn panicking_job_is_reported_and_worker_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = Worker::start(Storage::create(dir.path()).unwrap(), vec![effect_8x4()]).unwrap();
+        let mut bad = job(4);
+        bad.rgb.truncate(5); // frame shorter than width*height*3: composite indexes out of bounds
+        bad.save_original = false; // skip the plain encode so the overlay step is reached
+        w.submit(bad);
+        let r = wait(&w);
+        assert_eq!(r.id, 4);
+        assert!(r.outcome.unwrap_err().contains("panicked"));
+        w.submit(job(5));
+        assert!(wait(&w).outcome.is_ok());
     }
 }
