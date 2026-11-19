@@ -65,16 +65,14 @@ impl Hud {
 
     /// Show `image` as the review photo (re-uses one GPU texture).
     pub fn set_photo(&mut self, r: &mut Renderer, image: &Rgba) -> anyhow::Result<()> {
-        match self.sprites.photo {
-            Some((id, _, _)) => r.update_sprite(id, image),
-            None => {
-                let id = r.create_sprite(image)?;
-                self.sprites.photo = Some((id, image.width, image.height));
+        let id = match self.sprites.photo {
+            Some((id, _, _)) => {
+                r.update_sprite(id, image);
+                id
             }
-        }
-        if let Some(p) = self.sprites.photo.as_mut() {
-            (p.1, p.2) = (image.width, image.height);
-        }
+            None => r.create_sprite(image)?,
+        };
+        self.sprites.photo = Some((id, image.width, image.height));
         Ok(())
     }
 

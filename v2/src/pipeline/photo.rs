@@ -2,6 +2,7 @@
 //! effect overlay, JPEG with EXIF, atomic writes, and the review image.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::Context;
 use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
@@ -25,6 +26,17 @@ pub struct PhotoJob {
     pub save_original: bool,
 }
 
+/// Time spent in each stage of `process`, in milliseconds (a stage that did
+/// not run is 0).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Timings {
+    pub encode_original_ms: u64,
+    pub write_original_ms: u64,
+    pub filter_ms: u64,
+    pub encode_photo_ms: u64,
+    pub write_photo_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhotoDone {
     pub id: u64,
@@ -32,6 +44,7 @@ pub struct PhotoDone {
     pub original: Option<PathBuf>,
     /// What the guests see during review: the saved photo as RGBA.
     pub review: Rgba,
+    pub timings: Timings,
 }
 
 /// Baseline JPEG, 4:4:4 chroma (full colour detail), EXIF in APP1.
@@ -56,11 +69,17 @@ pub fn process(
     let exif = build_exif(&job.info);
     let (photo_path, original_path) = storage.paths_for(job.info.taken);
 
+    let mut t = Timings::default();
+    let ms = |since: Instant| since.elapsed().as_millis() as u64;
+
+    let clock = Instant::now();
     let plain = if job.save_original || !job.filter {
         Some(encode_jpeg(&job.rgb, job.width, job.height, job.jpeg_quality, &exif)?)
     } else {
         None
     };
+    t.encode_original_ms = ms(clock);
+    let clock = Instant::now();
     let original = match (&plain, job.save_original) {
         (Some(bytes), true) => {
             write_atomic(&original_path, bytes)?;
@@ -68,7 +87,9 @@ pub fn process(
         }
         _ => None,
     };
+    t.write_original_ms = ms(clock);
 
+    let clock = Instant::now();
     let photo_bytes = if job.filter {
         sepia(&mut job.rgb);
         if !effects.is_empty() {
@@ -84,13 +105,25 @@ pub fn process(
                 );
             }
         }
-        encode_jpeg(&job.rgb, job.width, job.height, job.jpeg_quality, &exif)?
+        t.filter_ms = ms(clock);
+        let clock = Instant::now();
+        let bytes = encode_jpeg(&job.rgb, job.width, job.height, job.jpeg_quality, &exif)?;
+        t.encode_photo_ms = ms(clock);
+        bytes
     } else {
         plain.expect("plain JPEG exists when the filter is off")
     };
+    let clock = Instant::now();
     write_atomic(&photo_path, &photo_bytes)?;
+    t.write_photo_ms = ms(clock);
 
-    Ok(PhotoDone { id: job.id, photo: photo_path, original, review: to_rgba(&job.rgb, job.width, job.height) })
+    Ok(PhotoDone {
+        id: job.id,
+        photo: photo_path,
+        original,
+        review: to_rgba(&job.rgb, job.width, job.height),
+        timings: t,
+    })
 }
 
 #[cfg(test)]
@@ -185,6 +218,9 @@ mod tests {
         let storage = Storage::create(dir.path()).unwrap();
         let done = process(job(true, false), &storage, &[effect(8, 8)], |_| 0).unwrap();
         assert!(done.photo.exists());
+        // Only sepia was applied: the left column carries no blue overlay.
+        let edge = decode(&done.photo).get_pixel(0, 8).0;
+        assert!(edge[0] > edge[1] && edge[1] > edge[2] && edge[2] < 120, "sepia only, no overlay: {edge:?}");
     }
 
     #[test]

@@ -40,7 +40,17 @@ impl Worker {
                 })
                 .map_err(|e| format!("{e:#}"));
                 match &outcome {
-                    Ok(d) => tracing::info!(id, photo = %d.photo.display(), ms = started.elapsed().as_millis() as u64, "photo saved"),
+                    Ok(d) => tracing::info!(
+                        id,
+                        photo = %d.photo.display(),
+                        ms = started.elapsed().as_millis() as u64,
+                        encode_original_ms = d.timings.encode_original_ms,
+                        write_original_ms = d.timings.write_original_ms,
+                        filter_ms = d.timings.filter_ms,
+                        encode_photo_ms = d.timings.encode_photo_ms,
+                        write_photo_ms = d.timings.write_photo_ms,
+                        "photo saved"
+                    ),
                     Err(e) => tracing::error!(id, "photo failed: {e}"),
                 }
                 if res_tx.send(PhotoResult { id, outcome }).is_err() {

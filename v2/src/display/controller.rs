@@ -113,6 +113,16 @@ pub struct Controller {
     pub filter: bool,
 }
 
+impl Drop for Controller {
+    /// Wait for a pending camera stop so libcamera isn't torn down mid-stop
+    /// at quit. A pending restart thread is not waited for.
+    fn drop(&mut self) {
+        if let Some(h) = self.stopping.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 impl Controller {
     /// Start the camera, storage, photo worker and monitors. A camera that
     /// fails here is a startup error (spec §5): the process exits and systemd
@@ -307,7 +317,10 @@ impl Controller {
                 Ok(done) => {
                     self.photo_count += 1;
                     self.monitors.recheck_disk();
-                    self.review_image = Some(done.review);
+                    // Only the photo being processed may reach the review screen.
+                    if matches!(self.booth.phase(), Phase::Processing { id, .. } if id == result.id) {
+                        self.review_image = Some(done.review);
+                    }
                     Event::PhotoReady { id: result.id }
                 }
                 Err(_) => Event::PhotoFailed { id: result.id },
