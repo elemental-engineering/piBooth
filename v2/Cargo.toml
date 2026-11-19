@@ -7,7 +7,7 @@ description = "Raspberry Pi 5 photo booth, v2"
 
 [features]
 default = []
-# Real Pi camera support. Requires libcamera-dev (>= 0.4) at build time.
+# Real Pi camera support. Requires libcamera-dev >= 0.5 (the Pi ships 0.5.2).
 libcamera = ["dep:libcamera"]
 
 [dependencies]

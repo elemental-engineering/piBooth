@@ -129,16 +129,19 @@ Idle ──press──► Countdown{deadline} ──deadline──► Capturing 
   start and after `idle_timeout_s` (default 120) without a press.
 - `Live`: live preview, no title.
 - `Countdown`: shows `N … 1` (default 5 s, matches v1's visible digits).
-  On entry: request AE/AWB metering. At `deadline - flash.lead_ms` trigger
-  flash (screen: white frame; strobe: arm). At deadline: lock AE/AWB and
-  request a capture burst.
-- `Capturing`: preview continues (screen flash stays white until burst
-  complete or `flash.max_ms`). Presses ignored.
+  AE/AWB run continuously. At `deadline - flash.lead_ms` (at least 100 ms):
+  `PrepareCapture` (high-quality noise reduction) and, in screen mode, the
+  white flash. At the deadline: `Capture{id}`; the next complete frame is the
+  photo. (Milestone 5 replaces the single frame with a burst.)
+- `Capturing`: preview continues (screen flash stays white until the photo
+  frame arrives or `flash.max_ms`; no frame within 5 s ⇒ release the camera and
+  review shows "Oops, try again"). Presses ignored.
 - `Processing`: the photo worker filters, encodes and saves; preview continues. Failure or a 10 s timeout ⇒ review shows "Oops, try again".
 - Every capture has an id; results for another id are ignored.
 - `Review`: shows the processed photo for `review_timeout_s` (default 5).
-  Presses ignored. The pipeline delivers a preview-resolution image first so
-  review starts without waiting for JPEG/DNG encoding.
+  Presses ignored. Review shows the saved photo (filtered when the
+  filter is on), returned by the worker as RGBA once its files are written. A
+  preview-first image is added only if Pi timing shows a visible wait.
 - Button presses are edge events; one press = one event. Holding the button
   does not retrigger.
 
@@ -147,10 +150,11 @@ Maintenance keys (keyboard): `Esc`/`q` quit, `Space` = press, `d` debug OSD,
 
 ### 4.2 Camera
 
-- Configuration: One BGR888 stream at 1456×1088 — the sensor's native size — serves preview and capture. ≈`flash.lead_ms` before the shot `PrepareCapture` sets `NoiseReductionMode = HighQuality`; the photo is the next complete frame after `Capture`. A raw Bayer stream is added in milestone 5 when `capture.save_dng = true`.
-- AE/AWB: AE/AWB meter during the lead (with the screen flash on in screen mode), then lock at `Capture` by switching `ExposureTimeMode` and `AnalogueGainMode` to Manual and `AwbEnable = false` (libcamera keeps the last computed values); `ReleaseCapture` (once the frame arrives) restores Auto and Fast noise reduction.
-- Burst: `capture.burst_frames` (default 6) consecutive frames at 60 fps
-  (~100 ms). With global shutter no rolling distortion exists, so alignment is
+- Configuration: one BGR888 stream at 1456×1088 — the sensor's native size — serves preview and capture. ≈`flash.lead_ms` before the shot `PrepareCapture` sets `NoiseReductionMode = HighQuality`; the photo is the next complete frame after `Capture`. A raw Bayer stream is added in milestone 5 when `capture.save_dng = true`. Requires libcamera ≥ 0.5 (`ExposureTimeMode`/`AnalogueGainMode`); Raspberry Pi OS ships 0.5.2.
+- AE/AWB: auto-exposure keeps metering during the lead (screen flash on in screen mode), so it exposes the photo for the lit scene. `Capture` also switches `ExposureTimeMode` and `AnalogueGainMode` to Manual and sets `AwbEnable = false` (libcamera keeps the last computed values). Because requests are already in flight, this lock applies only to frames after the photo; it exists for milestone 5 bursts. `ReleaseCapture`, sent when the photo arrives or on capture timeout, restores Auto and Fast noise reduction.
+- Burst: Milestone 5: `capture.burst_frames` (default 6) consecutive frames at 60 fps
+  (~100 ms), taken after the photo, starting from the first frame whose metadata
+  reports `ExposureTimeMode = Manual`. With global shutter no rolling distortion exists, so alignment is
   translation-only.
 - Tuning file: default `imx296.json` from libcamera; overridable in config.
 - `FakeCamera` produces an animated test pattern at 60 fps for laptop dev and
@@ -172,21 +176,21 @@ Maintenance keys (keyboard): `Esc`/`q` quit, `Space` = press, `d` debug OSD,
 
 ### 4.4 Image pipeline
 
-Input: N full-res RGB frames (+ optional raw). Steps, on the rayon pool:
+Milestone 3: one full-resolution RGB frame, processed on the single photo-worker thread (a panic or error ⇒ Oops). From milestone 5: N frames (+ optional raw) with stacking on the rayon pool.
 
-1. **Stack** (`capture.stack = "average" | "sharpest" | "off"`):
+1. (Milestone 5) **Stack** (`capture.stack = "average" | "sharpest" | "off"`):
    - `average`: estimate integer-pixel translation of each frame vs. the
      sharpest one by phase correlation on a downscaled luma; reject frames
      whose shift exceeds `capture.max_shift_px` (default 8); average the rest
      in `u16` accumulators.
    - `sharpest`: pick the frame with highest variance of Laplacian.
-2. **Save original**: unfiltered stacked image → `raw/booth_<ts>.jpg`
+2. **Save original**: unfiltered image (stacked from milestone 5) → `raw/booth_<ts>.jpg`
    (`storage.save_original`, default true). DNG of the first raw frame →
-   `raw/booth_<ts>.dng` when enabled.
+   `raw/booth_<ts>.dng` when enabled (milestone 5).
 3. **Filter** (when filter enabled): sepia with the standard RGB matrix,
    clamped to 255 (no max normalisation).
 4. **Effect**: a random PNG from `effects/`, resized once at startup to the
-   capture size (Lanczos), alpha-composited.
+   capture size (Lanczos), alpha-composited. Overlays whose size differs from the frame are skipped with a warning; unreadable overlays are skipped; no `effects/` folder ⇒ sepia only.
 5. **Encode**: JPEG quality `capture.jpeg_quality` (95), 4:4:4, pure-Rust `jpeg-encoder`, with EXIF Make/Model/Orientation/DateTimeOriginal/ExposureTime/ISO and GPS when configured → `photos/booth_<ts>.jpg`; `_2`, `_3`… for same-second shots; temp file + rename.
 6. Return the review image (the saved photo as RGBA) and re-check disk usage; upload is enqueued in milestone 4.
 
@@ -195,7 +199,7 @@ Input: N full-res RGB frames (+ optional raw). Steps, on the rayon pool:
 `flash.mode = "screen" | "strobe" | "none"`.
 
 - `screen`: white frame from `deadline - lead_ms` (default 300 ms, to let AE
-  meter it) until the burst completes.
+  meter it) until the photo frame arrives (the burst from milestone 5), capped at `flash.max_ms`.
 - `strobe`: GPIO output line (`flash.gpio_line`, active level configurable)
   driven high for `flash.pulse_ms` covering the burst, timed from the camera's
   frame-start metadata. Exact per-exposure sync via the IMX296 external
@@ -292,8 +296,9 @@ CLI: `pibooth [--config PATH] [--fake-camera] [--no-gpio] [--bench]`.
 
 ## 5. Error handling
 
-- Startup: config errors, missing fonts/effects, or camera not found → log and
+- Startup: config errors, missing fonts, or camera not found → log and
   exit non-zero (systemd restarts). Missing GPIO → warning, keyboard-only.
+  Missing or unreadable `effects/` → warning; photos get sepia without an overlay.
 - Runtime camera error (request failure, sensor drop, or no frames for 3 s) → OSD error banner,
   camera restart with backoff; state returns to `Idle`.
 - Pipeline failure on a capture → log, show "Oops, try again" during review,

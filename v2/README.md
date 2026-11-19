@@ -3,8 +3,8 @@
 Rewrite of the Python booth (`../main.py`). Design: `../docs/superpowers/specs/2026-11-18-rust-v2-design.md`.
 
 Status: milestone 3 — live preview, button and countdown, screen flash,
-full-quality capture (high-quality noise reduction, exposure and white balance
-locked for the shot), sepia + effect overlay, JPEG with EXIF, review of the
+full-quality capture (high-quality noise reduction, exposure metered under the
+flash), sepia + effect overlay, JPEG with EXIF, review of the
 saved photo, status icons and camera auto-restart. Upload to Immich arrives in
 milestone 4.
 
@@ -33,8 +33,9 @@ cargo run -- --config config.dev.toml --fake-camera --windowed --no-gpio --bench
 `v2/photos/` and `v2/raw/`.
 
 Keys: `Space` take a photo, `d` debug overlay (includes the photo count), `r`
-mirror preview, `f` filter on/off for the next photos, `Esc`/`q` quit. The red square marks the image's top-left corner; with
-mirroring on it appears top-right.
+mirror preview, `f` filter on/off for the next photos, `Esc`/`q` quit. The red
+square marks the image's top-left corner; with mirroring on it appears
+top-right.
 
 ## Button
 
