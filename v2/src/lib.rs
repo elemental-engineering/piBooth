@@ -11,3 +11,4 @@ pub mod osd;
 pub mod pipeline;
 pub mod state;
 pub mod stats;
+pub mod storage;
