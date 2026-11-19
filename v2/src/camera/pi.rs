@@ -37,15 +37,15 @@ const PREVIEW_FORMAT: PixelFormat = PixelFormat::new(u32::from_le_bytes(*b"BG24"
 const BUFFER_COUNT: u32 = 4;
 
 pub struct PiCamera {
-    cfg: CameraCfg,
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     commands: Option<mpsc::Sender<CameraCommand>>,
 }
 
 impl PiCamera {
-    pub fn new(cfg: CameraCfg) -> Self {
-        Self { cfg, running: Arc::new(AtomicBool::new(false)), thread: None, commands: None }
+    /// The tuning file, if any, is applied by `main` before any thread starts.
+    pub fn new(_cfg: CameraCfg) -> Self {
+        Self { running: Arc::new(AtomicBool::new(false)), thread: None, commands: None }
     }
 }
 
@@ -53,11 +53,6 @@ impl Camera for PiCamera {
     fn start(&mut self, link: CameraLink) -> anyhow::Result<()> {
         if self.thread.is_some() {
             return Ok(());
-        }
-        if !self.cfg.tuning_file.is_empty() {
-            // Read by the Raspberry Pi IPA when the camera is configured.
-            // SAFETY: called before any other thread reads the environment.
-            unsafe { std::env::set_var("LIBCAMERA_RPI_TUNING_FILE", &self.cfg.tuning_file) };
         }
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
@@ -254,6 +249,9 @@ fn session(
     while running.load(Ordering::SeqCst) {
         for cmd in commands.try_iter() {
             tracing::debug!(?cmd, "camera command");
+            // The photo is the next completed request (already in flight), metered
+            // under the flash since PrepareCapture. The lock set here applies only
+            // to requests queued after it, i.e. to frames following the photo.
             pending.on_command(cmd);
             if let CameraCommand::Capture { id } = cmd {
                 capture = Some(id);

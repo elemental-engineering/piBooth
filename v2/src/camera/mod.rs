@@ -47,8 +47,10 @@ impl Backoff {
 pub enum CameraCommand {
     /// Switch to high-quality noise reduction; auto-exposure keeps metering.
     PrepareCapture,
-    /// Lock exposure and white balance, and deliver the next complete frame
-    /// as capture `id` (full resolution, never mirrored).
+    /// Deliver the next complete frame as capture `id` (full resolution,
+    /// never mirrored); it is metered under the flash since `PrepareCapture`.
+    /// Exposure and white balance are then locked for the frames after it
+    /// (used by milestone 5 bursts) until `ReleaseCapture`.
     Capture { id: u64 },
     /// Back to preview settings: auto exposure/white balance, fast noise reduction.
     ReleaseCapture,

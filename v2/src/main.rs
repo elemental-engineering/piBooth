@@ -38,6 +38,14 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load(cli.config.as_deref()).context("loading configuration")?;
     tracing::info!(upload = cfg.upload_enabled(), "configuration loaded");
+    #[cfg(feature = "libcamera")]
+    if !cfg.camera.tuning_file.is_empty() {
+        // Read by the Raspberry Pi IPA when the camera is configured.
+        // SAFETY: no other thread exists yet (the button, camera, monitor and
+        // display threads are all spawned below), so nothing reads the
+        // environment concurrently.
+        unsafe { std::env::set_var("LIBCAMERA_RPI_TUNING_FILE", &cfg.camera.tuning_file) };
+    }
 
     let (tx, rx) = std::sync::mpsc::channel();
     let button = if cli.no_gpio {

@@ -277,11 +277,11 @@ impl Controller {
         let frames: Vec<CapturedFrame> = c.captures.try_iter().collect();
         for f in frames {
             let id = f.id;
-            let cmds = self.booth.handle(Event::FrameCaptured { id }, now);
-            if !matches!(self.booth.phase(), Phase::Processing { id: p, .. } if p == id) {
-                tracing::warn!(id, "late captured frame ignored");
+            if !matches!(self.booth.phase(), Phase::Capturing { id: p, .. } if p == id) {
+                tracing::warn!(id, "unexpected captured frame ignored");
                 continue;
             }
+            let cmds = self.booth.handle(Event::FrameCaptured { id }, now);
             self.apply(cmds);
             self.worker.submit(PhotoJob {
                 id,
@@ -449,9 +449,9 @@ mod tests {
         })
     }
 
-    fn controller(dir: &tempfile::TempDir, f: CameraFactory) -> (Controller, mpsc::Sender<Action>) {
+    fn controller(dir: &tempfile::TempDir, f: CameraFactory, now: Instant) -> (Controller, mpsc::Sender<Action>) {
         let (tx, rx) = mpsc::channel();
-        (Controller::start_with(&cfg(dir.path()), f, None, rx, fast(), Instant::now()).unwrap(), tx)
+        (Controller::start_with(&cfg(dir.path()), f, None, rx, fast(), now).unwrap(), tx)
     }
 
     /// Run `update(Instant::now())` until `done` holds (real time, ≤ 5 s).
@@ -482,14 +482,14 @@ mod tests {
     #[test]
     fn creates_storage_folders_at_start() {
         let dir = tempfile::tempdir().unwrap();
-        let (_c, _tx) = controller(&dir, factory(Arc::new(AtomicUsize::new(0)), usize::MAX));
+        let (_c, _tx) = controller(&dir, factory(Arc::new(AtomicUsize::new(0)), usize::MAX), Instant::now());
         assert!(dir.path().join("photos").is_dir() && dir.path().join("raw").is_dir());
     }
 
     #[test]
     fn button_press_takes_saves_and_reviews_a_photo() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut c, tx) = controller(&dir, factory(Arc::new(AtomicUsize::new(0)), usize::MAX));
+        let (mut c, tx) = controller(&dir, factory(Arc::new(AtomicUsize::new(0)), usize::MAX), Instant::now());
         tx.send(Action::Press).unwrap();
         c.update(Instant::now());
         assert!(matches!(c.booth.phase(), Phase::Countdown { .. }));
@@ -505,10 +505,52 @@ mod tests {
         run_until(&mut c, |c| c.booth.phase() == Phase::Live);
     }
 
+    /// A fake camera that delivers every capture twice (same id).
+    struct DuplicatingCamera {
+        inner: FakeCamera,
+        captures: Option<mpsc::Sender<CapturedFrame>>,
+    }
+    impl Camera for DuplicatingCamera {
+        fn start(&mut self, link: CameraLink) -> anyhow::Result<()> {
+            self.captures = Some(link.captures.clone());
+            self.inner.start(link)
+        }
+        fn command(&mut self, cmd: CameraCommand) {
+            if let (CameraCommand::Capture { id }, Some(tx)) = (cmd, &self.captures) {
+                let frame =
+                    Frame { width: 64, height: 48, data: vec![0; 64 * 48 * 3], seq: 0, captured_at: Instant::now() };
+                let _ = tx.send(CapturedFrame { id, frame, meta: Default::default() });
+            }
+            self.inner.command(cmd);
+        }
+        fn stop(&mut self) {
+            self.inner.stop();
+        }
+    }
+
+    #[test]
+    fn duplicate_captured_frame_is_processed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let f: CameraFactory = Arc::new(|| -> Box<dyn Camera> {
+            Box::new(DuplicatingCamera { inner: FakeCamera::new((64, 48), 100), captures: None })
+        });
+        let (mut c, tx) = controller(&dir, f, Instant::now());
+        tx.send(Action::Press).unwrap();
+        run_until(&mut c, |c| matches!(c.booth.phase(), Phase::Review { .. }));
+        // Let any (wrongly) submitted second job finish and be collected.
+        for _ in 0..40 {
+            c.update(Instant::now());
+            std::thread::sleep(5 * MS);
+        }
+        assert_eq!(c.photo_count(), 1);
+        let photos: Vec<_> = std::fs::read_dir(dir.path().join("photos")).unwrap().collect();
+        assert_eq!(photos.len(), 1);
+    }
+
     #[test]
     fn toggles_and_passthrough_actions() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut c, _tx) = controller(&dir, factory(Arc::new(AtomicUsize::new(0)), usize::MAX));
+        let (mut c, _tx) = controller(&dir, factory(Arc::new(AtomicUsize::new(0)), usize::MAX), Instant::now());
         let now = Instant::now();
         assert_eq!(c.on_action(Action::ToggleDebug, now), None);
         assert!(c.debug);
@@ -520,10 +562,10 @@ mod tests {
     }
 
     #[test]
-    fn stalled_camera_shows_banner_without_blocking() {
+    fn stalled_camera_shows_banner() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut c, _tx) = controller(&dir, Arc::new(|| -> Box<dyn Camera> { Box::new(SilentCamera) }));
         let t0 = Instant::now();
+        let (mut c, _tx) = controller(&dir, Arc::new(|| -> Box<dyn Camera> { Box::new(SilentCamera) }), t0);
         c.update(t0 + 299 * MS);
         assert!(!c.scene_input(t0, (100, 100)).banner);
         c.update(t0 + 300 * MS);
@@ -534,7 +576,7 @@ mod tests {
     #[test]
     fn press_ignored_while_camera_down() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut c, _tx) = controller(&dir, factory(Arc::new(AtomicUsize::new(0)), usize::MAX));
+        let (mut c, _tx) = controller(&dir, factory(Arc::new(AtomicUsize::new(0)), usize::MAX), Instant::now());
         c.cam.as_ref().unwrap().mailbox.close("gone");
         c.update(Instant::now());
         assert!(c.cam.is_none());
@@ -546,7 +588,7 @@ mod tests {
     fn dead_camera_restarts_in_background() {
         let starts = Arc::new(AtomicUsize::new(0));
         let dir = tempfile::tempdir().unwrap();
-        let (mut c, _tx) = controller(&dir, factory(starts.clone(), usize::MAX));
+        let (mut c, _tx) = controller(&dir, factory(starts.clone(), usize::MAX), Instant::now());
         c.cam.as_ref().unwrap().mailbox.close("sensor gone");
         c.update(Instant::now());
         assert!(c.scene_input(Instant::now(), (100, 100)).banner);
@@ -567,7 +609,7 @@ mod tests {
             let inner = factory(Arc::new(AtomicUsize::new(0)), if i == 1 || i == 2 { 0 } else { usize::MAX });
             inner()
         });
-        let (mut c, _tx) = controller(&dir, f);
+        let (mut c, _tx) = controller(&dir, f, Instant::now());
         c.cam.as_ref().unwrap().mailbox.close("sensor gone");
         c.update(Instant::now());
         assert!(c.cam.is_none(), "loss detected");

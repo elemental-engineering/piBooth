@@ -4,9 +4,11 @@
 //!
 //! Capture flow: `lead` before the deadline the camera is prepared (high
 //! quality noise reduction; screen flash on in screen mode) so auto-exposure
-//! meters the lit scene. At the deadline the next frame is captured with
-//! exposure and white balance locked; once it arrives the flash goes off,
-//! the lock is released and the photo is processed; review shows the result
+//! meters the lit scene. At the deadline the next complete frame is the
+//! photo (metered under the flash since the prepare step); the camera then
+//! locks exposure and white balance for the frames after it (used by
+//! milestone 5 bursts). Once the photo arrives the flash goes off, the lock
+//! is released and the photo is processed; review shows the result
 //! or "Oops, try again". Every capture has an id; results for another id are
 //! ignored.
 
@@ -69,7 +71,9 @@ pub enum Command {
     PrepareCapture,
     FlashOn,
     FlashOff,
-    /// Lock exposure/white balance and deliver the next frame as capture `id`.
+    /// Deliver the next complete frame as capture `id` (metered under the
+    /// flash since `PrepareCapture`); exposure/white balance are then locked
+    /// for the frames after it.
     Capture {
         id: u64,
     },
