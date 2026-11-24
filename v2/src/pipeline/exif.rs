@@ -19,35 +19,37 @@ pub struct PhotoInfo {
     pub gps: Option<(f64, f64)>,
 }
 
-const ASCII: u16 = 2;
-const SHORT: u16 = 3;
-const LONG: u16 = 4;
-const RATIONAL: u16 = 5;
-const BYTE: u16 = 1;
-const UNDEFINED: u16 = 7;
+pub(crate) const ASCII: u16 = 2;
+pub(crate) const SHORT: u16 = 3;
+pub(crate) const LONG: u16 = 4;
+pub(crate) const RATIONAL: u16 = 5;
+pub(crate) const BYTE: u16 = 1;
+pub(crate) const UNDEFINED: u16 = 7;
+pub(crate) const SRATIONAL: u16 = 10;
 
-struct Entry {
-    tag: u16,
-    kind: u16,
-    count: u32,
-    data: Vec<u8>,
+/// One TIFF directory entry; `data` is the little-endian value bytes.
+pub(crate) struct Entry {
+    pub tag: u16,
+    pub kind: u16,
+    pub count: u32,
+    pub data: Vec<u8>,
 }
 
-fn ascii(tag: u16, s: &str) -> Entry {
+pub(crate) fn ascii(tag: u16, s: &str) -> Entry {
     let mut data = s.as_bytes().to_vec();
     data.push(0);
     Entry { tag, kind: ASCII, count: data.len() as u32, data }
 }
 
-fn short(tag: u16, v: u16) -> Entry {
+pub(crate) fn short(tag: u16, v: u16) -> Entry {
     Entry { tag, kind: SHORT, count: 1, data: v.to_le_bytes().to_vec() }
 }
 
-fn long(tag: u16, v: u32) -> Entry {
+pub(crate) fn long(tag: u16, v: u32) -> Entry {
     Entry { tag, kind: LONG, count: 1, data: v.to_le_bytes().to_vec() }
 }
 
-fn rationals(tag: u16, values: &[(u32, u32)]) -> Entry {
+pub(crate) fn rationals(tag: u16, values: &[(u32, u32)]) -> Entry {
     let data = values.iter().flat_map(|(n, d)| n.to_le_bytes().into_iter().chain(d.to_le_bytes())).collect();
     Entry { tag, kind: RATIONAL, count: values.len() as u32, data }
 }
@@ -64,7 +66,7 @@ fn dms(value: f64) -> [(u32, u32); 3] {
 
 /// Serialise one IFD at `offset` (from the TIFF header). `next` is the
 /// following IFD's offset (0 = none). Values over 4 bytes go after the IFD.
-fn write_ifd(mut entries: Vec<Entry>, offset: u32, next: u32) -> Vec<u8> {
+pub(crate) fn write_ifd(mut entries: Vec<Entry>, offset: u32, next: u32) -> Vec<u8> {
     entries.sort_by_key(|e| e.tag);
     let n = entries.len() as u32;
     let mut extra_at = offset + 2 + n * 12 + 4;
@@ -93,7 +95,7 @@ fn write_ifd(mut entries: Vec<Entry>, offset: u32, next: u32) -> Vec<u8> {
     ifd
 }
 
-fn ifd_len(entries: &[Entry]) -> u32 {
+pub(crate) fn ifd_len(entries: &[Entry]) -> u32 {
     let extra: u32 = entries.iter().filter(|e| e.data.len() > 4).map(|e| (e.data.len() as u32 + 1) & !1).sum();
     2 + entries.len() as u32 * 12 + 4 + extra
 }
