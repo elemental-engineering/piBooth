@@ -70,20 +70,20 @@ replaces it).
               └───┬───────────────────────┬───────────┘
         latest frame (triple buffer)   CaptureBurst (channel)
                   │                       │
-   ┌──────────────▼─────────┐   ┌─────────▼──────────────┐
-   │ render loop (main thd) │   │ pipeline worker (rayon) │
+   ┌──────────────▼─────────┐   ┌─────────▼───────────────┐
+   │ render loop (main thd) │   │ photo worker thread     │
    │ GL: texture, letterbox,│   │ stack → filter → effect │
    │ mirror, OSD layers     │   │ → JPEG/EXIF (+DNG)      │
-   └──────▲────────┬────────┘   └─────────┬──────────────┘
+   └──────▲────────┬────────┘   └─────────┬───────────────┘
           │        │ commands             │ PhotoSaved
    ┌──────┴────────▼────────┐             │
    │     BoothState machine │◄────────────┘
    └──────▲────────▲────────┘
-  InputEvent│      │Status                ┌──────────────┐
-   ┌────────┴──┐ ┌─┴──────────┐  enqueue  │ upload task  │
+  InputEvent│      │Status                ┌───────────────┐
+   ┌────────┴──┐ ┌─┴──────────┐  enqueue  │ upload task   │
    │ input     │ │ monitors   │ ─────────►│ (thread, disk │
-   │ GPIO/keys │ │ temp/disk/ │           │  queue)      │
-   └───────────┘ │ net        │           └──────────────┘
+   │ GPIO/keys │ │ temp/disk/ │           │  queue)       │
+   └───────────┘ │ net        │           └───────────────┘
                  └────────────┘
 ```
 
@@ -192,7 +192,7 @@ Milestone 3: one full-resolution RGB frame, processed on the single photo-worker
 4. **Effect**: a random PNG from `effects/`, resized once at startup to the
    capture size (Lanczos), alpha-composited. Overlays whose size differs from the frame are skipped with a warning; unreadable overlays are skipped; no `effects/` folder ⇒ sepia only.
 5. **Encode**: JPEG quality `capture.jpeg_quality` (95), 4:4:4, pure-Rust `jpeg-encoder`, with EXIF Make/Model/Orientation/DateTimeOriginal/ExposureTime/ISO and GPS when configured → `photos/booth_<ts>.jpg`; `_2`, `_3`… for same-second shots; temp file + rename.
-6. Return the review image (the saved photo as RGBA) and re-check disk usage; upload is enqueued in milestone 4.
+6. Return the review image (the saved photo as RGBA) and re-check disk usage; the photo is queued for upload (§4.6).
 
 ### 4.5 Flash
 
@@ -210,8 +210,8 @@ Milestone 3: one full-resolution RGB frame, processed on the single photo-worker
 - Queue: `queue/<photo stem>.json` per photo — `photo`, `taken` (RFC 3339 UTC,
   milliseconds), `asset_id`, `attempts`, `last_error` — written atomically by the
   photo worker right after the photo is saved (also when upload is off, so photos
-  go up once it is configured). Processed oldest first; unreadable entries are
-  renamed `*.json.bad`.
+  go up once it is configured). Processed oldest first; entries with invalid JSON
+  are renamed `*.json.bad`.
 - Upload thread (blocking `ureq`, rustls with `ring`, system certificate store),
   started when the API key and `base_url` are set. At start `GET /users/me`
   logs the key's owner or the failure. Per entry: `POST {base_url}/assets`
@@ -229,6 +229,15 @@ Milestone 3: one full-resolution RGB frame, processed on the single photo-worker
   attention", retried every 10 min. Timeouts: connect 5 s, request 120 s. The
   oldest photo is always retried first. New photos do not shorten a pending retry
   wait.
+- Per-photo permanent failures (this photo or its album step) set `next_try`
+  (+10 min) in the entry and do not block the other photos; because the asset id
+  is stored before the album step, only the album step is retried.
+- 401/403 (bad key, missing permission) pause all uploads for 10 min.
+- 3xx is a configuration error (`base_url`): redirects are not followed.
+- Startup reconcile: `queue/.last` holds the newest queued photo's stem; at start,
+  photos in `photos/` newer than it without an entry are queued (crash or power
+  loss between save and enqueue). Without `.last` nothing is queued, so older
+  photos are not mass-uploaded.
 - An entry is deleted once uploaded and added to the album; a missing photo file
   drops its entry with a warning. Local photos are never deleted by v2. At quit
   the upload thread is detached; an interrupted upload repeats at the next start

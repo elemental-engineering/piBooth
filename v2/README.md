@@ -2,7 +2,7 @@
 
 Rewrite of the Python booth (`../main.py`). Design: `../docs/superpowers/specs/2026-11-18-rust-v2-design.md`.
 
-Status: milestone 3 — live preview, button and countdown, screen flash,
+Status: milestone 4 — live preview, button and countdown, screen flash,
 full-quality capture (high-quality noise reduction, exposure metered under the
 flash), sepia + effect overlay, JPEG with EXIF, review of the
 saved photo, status icons, camera auto-restart, and background upload to
@@ -43,7 +43,23 @@ or why not. Failures retry from 5 s, doubling to 10 min; a bad key or unknown
 album is retried every 10 min — fix the config and restart, queued photos go up.
 A new photo does not cut a retry wait short: after a failure the next try is at
 the scheduled retry time.
-`d` shows the queue length and the last upload error.
+`d` shows the queue length and the last upload error, or
+`Upload: off (N queued)` when upload isn't configured.
+
+Good to know:
+
+- Photos taken before milestone 4 are not uploaded automatically.
+- Queued photos go to whatever server and album are configured at the moment
+  they upload. Delete `queue/` to discard queued photos.
+- A reverse proxy in front of Immich must accept request bodies of a few MB
+  (nginx: `client_max_body_size`).
+- A bad album id still uploads the photos; only the album step is retried.
+- A photo that keeps failing is retried every 10 min without blocking the
+  others. A wrong key or missing permission (401/403) pauses all uploads for
+  10 min; a redirect means `immich.base_url` is wrong (redirects are not
+  followed).
+- On start, photos that were saved but not queued (power loss between the two
+  steps) are queued.
 
 Without a key or `base_url`, photos are still queued and go up once upload is
 configured. HTTPS uses the Pi's certificate store, so a private CA works once
