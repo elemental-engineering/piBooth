@@ -167,6 +167,13 @@ impl Controller {
         // Photos are queued even when upload is not configured, so they go
         // up once it is (spec §4.8).
         let queue = Arc::new(Queue::open(&cfg.storage.root)?);
+        match queue.reconcile(&cfg.storage.root.join("photos")) {
+            Ok(0) => {}
+            Ok(count) => {
+                tracing::warn!(count, "queued photos that were saved but not queued (crash or power loss)");
+            }
+            Err(e) => tracing::warn!("cannot check for unqueued photos: {e:#}"),
+        }
         let uploader = match (&cfg.immich_api_key, cfg.upload_enabled()) {
             (Some(key), true) => {
                 let album = Some(cfg.immich.album_id.as_str());
