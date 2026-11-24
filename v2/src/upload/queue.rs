@@ -56,6 +56,17 @@ fn taken_from_name(stem: &str, path: &Path) -> String {
     }
 }
 
+/// Sort key of a booth photo stem `booth_YYYYMMDD-HHMMSS[_N]`: (timestamp
+/// part, N), N defaulting to 1, so `_10` sorts after `_9`. `None` for any
+/// other name (stray files in `photos/`).
+fn booth_key(stem: &str) -> Option<(&str, u64)> {
+    let rest = stem.strip_prefix("booth_")?;
+    match rest.split_once('_') {
+        Some((ts, n)) => Some((ts, n.parse().unwrap_or(1))),
+        None => Some((rest, 1)),
+    }
+}
+
 pub struct Queue {
     dir: PathBuf,
 }
@@ -99,7 +110,8 @@ impl Queue {
 
     /// Remember the newest queued photo (names sort by time), only forwards.
     fn advance_last(&self, stem: &str) {
-        if self.read_last().is_some_and(|l| l.as_str() >= stem) {
+        let Some(key) = booth_key(stem) else { return };
+        if self.read_last().is_some_and(|l| booth_key(&l).is_some_and(|k| k >= key)) {
             return;
         }
         if let Err(e) = write_atomic(&self.last_path(), stem.as_bytes()) {
@@ -118,19 +130,21 @@ impl Queue {
                 .map(|e| e.path())
                 .filter(|p| p.extension().is_some_and(|x| x == "jpg"))
                 .filter_map(|p| Some((p.file_stem()?.to_string_lossy().into_owned(), p)))
+                .filter(|(stem, _)| booth_key(stem).is_some()) // stray JPEGs are not booth photos
                 .collect(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", photos_dir.display())),
         };
-        photos.sort();
+        photos.sort_by(|a, b| booth_key(&a.0).cmp(&booth_key(&b.0)));
         let Some(last) = self.read_last() else {
             if let Some((stem, _)) = photos.last() {
                 write_atomic(&self.last_path(), stem.as_bytes())?;
             }
             return Ok(0);
         };
+        let last_key = booth_key(&last);
         let mut count = 0;
-        for (stem, path) in photos.iter().filter(|(stem, _)| stem.as_str() > last.as_str()) {
+        for (stem, path) in photos.iter().filter(|(stem, _)| booth_key(stem) > last_key) {
             if self.entry_path(stem.as_ref()).exists() {
                 continue;
             }
@@ -308,16 +322,41 @@ mod tests {
         let q = Queue::open(dir.path()).unwrap();
         let photos = jpg_dir(dir.path(), &["booth_20261119-185907.jpg"]);
         q.reconcile(&photos).unwrap();
-        jpg_dir(dir.path(), &["booth_20261119-190000.jpg", "booth_20261119-190000_1.jpg", "other.jpg"]);
-        // "other.jpg" sorts after the marker too; it falls back to mtime.
-        assert_eq!(q.reconcile(&photos).unwrap(), 3);
+        jpg_dir(dir.path(), &["booth_20261119-190000.jpg", "booth_20261119-190000_2.jpg"]);
+        assert_eq!(q.reconcile(&photos).unwrap(), 2);
         let local = chrono::NaiveDateTime::parse_from_str("2026-11-19 19:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
         let by_name: Vec<_> = q.pending().into_iter().map(|(f, e)| (f.file_name().unwrap().to_owned(), e)).collect();
         let e = &by_name.iter().find(|(n, _)| n == "booth_20261119-190000.json").unwrap().1;
         assert_eq!(e.taken, taken_utc(local));
-        assert!(by_name.iter().any(|(n, e)| n == "other.json" && e.taken.ends_with('Z')));
         // Second run: everything is queued or older than the marker.
         assert_eq!(q.reconcile(&photos).unwrap(), 0);
+    }
+
+    #[test]
+    fn stray_jpegs_are_not_queued_and_do_not_move_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::open(dir.path()).unwrap();
+        let photos = jpg_dir(dir.path(), &["booth_20261119-185907.jpg", "party.jpg"]);
+        assert_eq!(q.reconcile(&photos).unwrap(), 0);
+        assert_eq!(last(dir.path()).as_deref(), Some("booth_20261119-185907"));
+        assert_eq!(q.reconcile(&photos).unwrap(), 0);
+        assert!(q.is_empty());
+        q.enqueue(&photo(dir.path(), "party.jpg"), "t").unwrap();
+        assert_eq!(last(dir.path()).as_deref(), Some("booth_20261119-185907"));
+    }
+
+    #[test]
+    fn numeric_suffix_sorts_numerically() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::open(dir.path()).unwrap();
+        let photos = jpg_dir(dir.path(), &["booth_20261119-190000.jpg", "booth_20261119-190000_9.jpg"]);
+        q.reconcile(&photos).unwrap(); // marker = _9
+        assert_eq!(last(dir.path()).as_deref(), Some("booth_20261119-190000_9"));
+        jpg_dir(dir.path(), &["booth_20261119-190000_10.jpg"]);
+        assert_eq!(q.reconcile(&photos).unwrap(), 1);
+        assert_eq!(last(dir.path()).as_deref(), Some("booth_20261119-190000_10"));
+        assert_eq!(booth_key("booth_X"), Some(("X", 1)));
+        assert!(booth_key("booth_X_10") > booth_key("booth_X_9"));
     }
 
     #[test]
