@@ -2,3 +2,4 @@
 
 pub mod immich;
 pub mod queue;
+pub mod uploader;
