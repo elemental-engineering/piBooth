@@ -27,12 +27,12 @@ use libcamera::framebuffer_allocator::{FrameBuffer, FrameBufferAllocator};
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
 use libcamera::geometry::Size;
 use libcamera::pixel_format::PixelFormat;
-use libcamera::request::{RequestStatus, ReuseFlag};
-use libcamera::stream::StreamRole;
+use libcamera::request::{Request, RequestStatus, ReuseFlag};
+use libcamera::stream::{Stream, StreamRole};
 
 use super::{BurstCollector, Camera, CameraCommand, CameraLink, CaptureMeta, RawCapture, SENSOR_FPS, SENSOR_SIZE};
 use crate::config::CameraCfg;
-use crate::frame::{Frame, FrameMailbox, copy_packed, copy_u16_le};
+use crate::frame::{Frame, FrameMailbox, copy_packed, copy_u16_le, raw_plane_fits};
 use crate::pipeline::dng::{RawColour, RawImage, cfa_from_fourcc};
 use crate::stats::{FrameSample, FrameTiming};
 
@@ -186,6 +186,62 @@ impl PendingControls {
     }
 }
 
+/// Which raw-capture warnings were already given in this camera session.
+#[derive(Default)]
+struct RawWarned {
+    failed: bool,
+    black: bool,
+}
+
+/// The raw frame of `req` for the DNG. Any problem is logged (once per
+/// session) and gives `None`: the photo is delivered without a DNG.
+fn raw_capture(
+    req: &Request,
+    rs: &Stream,
+    (rsize, rstride, cfa): (Size, usize, [u8; 4]),
+    md: &ControlList,
+    warned: &mut RawWarned,
+) -> Option<RawCapture> {
+    let mut fail = |why: &str| {
+        if !std::mem::replace(&mut warned.failed, true) {
+            tracing::warn!("raw frame unusable, photo saved without DNG: {why}");
+        }
+    };
+    let Some(rfb) = req.buffer::<MemoryMappedFrameBuffer<FrameBuffer>>(rs) else {
+        fail("request without raw buffer");
+        return None;
+    };
+    let Some(plane) = rfb.data().first().copied() else {
+        fail("raw buffer has no plane");
+        return None;
+    };
+    if !raw_plane_fits(plane.len(), rstride, rsize.width, rsize.height) {
+        fail(&format!(
+            "raw plane of {} bytes, stride {rstride}, does not fit {}x{}",
+            plane.len(),
+            rsize.width,
+            rsize.height
+        ));
+        return None;
+    }
+    let data = copy_u16_le(plane, rstride, rsize.width, rsize.height);
+    let black_levels = md.get::<SensorBlackLevels>().ok().map(|v| v.0);
+    if let (Some(b), Some(max)) = (black_levels, data.iter().max())
+        && i64::from(*max) < i64::from(b[0])
+        && !std::mem::replace(&mut warned.black, true)
+    {
+        tracing::warn!("raw samples look LSB-aligned; DNG black level may be wrong");
+    }
+    let image = RawImage { width: rsize.width, height: rsize.height, cfa, data };
+    let m = md.get::<ColourCorrectionMatrix>().ok().map(|c| c.0);
+    let colour = RawColour {
+        black_levels,
+        colour_gains: md.get::<ColourGains>().ok().map(|v| (v.0[0], v.0[1])),
+        ccm: m.map(|m| [m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]]),
+    };
+    Some(RawCapture { image, colour })
+}
+
 fn session(
     link: &CameraLink,
     commands: &mpsc::Receiver<CameraCommand>,
@@ -297,6 +353,7 @@ fn session(
     let mut last_report = Instant::now();
     let mut pending = PendingControls::default();
     let mut burst: Option<BurstCollector> = None;
+    let mut raw_warned = RawWarned::default();
     while running.load(Ordering::SeqCst) {
         for cmd in commands.try_iter() {
             tracing::debug!(?cmd, "camera command");
@@ -337,25 +394,7 @@ fn session(
                         gain: md.get::<AnalogueGain>().ok().map(|v| v.0),
                     };
                     let raw = match (&raw_stream, raw_layout) {
-                        (Some(rs), Some((rsize, rstride, cfa))) => {
-                            let rfb: &MemoryMappedFrameBuffer<FrameBuffer> =
-                                req.buffer(rs).ok_or_else(|| anyhow!("request without raw buffer"))?;
-                            let image = RawImage {
-                                width: rsize.width,
-                                height: rsize.height,
-                                cfa,
-                                data: copy_u16_le(rfb.data()[0], rstride, rsize.width, rsize.height),
-                            };
-                            let m = md.get::<ColourCorrectionMatrix>().ok().map(|c| c.0);
-                            let colour = RawColour {
-                                black_levels: md.get::<SensorBlackLevels>().ok().map(|v| v.0),
-                                colour_gains: md.get::<ColourGains>().ok().map(|v| (v.0[0], v.0[1])),
-                                ccm: m.map(|m| {
-                                    [m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]]
-                                }),
-                            };
-                            Some(RawCapture { image, colour })
-                        }
+                        (Some(rs), Some(layout)) => raw_capture(&req, rs, layout, md, &mut raw_warned),
                         _ => None,
                     };
                     tracing::info!(

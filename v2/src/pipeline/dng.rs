@@ -158,9 +158,11 @@ fn bytes(tag: u16, values: &[u8]) -> Entry {
 }
 
 /// The complete `.dng` file.
-pub fn encode(raw: &RawImage, colour: &RawColour, info: &PhotoInfo) -> Vec<u8> {
+pub fn encode(raw: &RawImage, colour: &RawColour, info: &PhotoInfo) -> anyhow::Result<Vec<u8>> {
     let n = raw.width as usize * raw.height as usize;
-    assert!(raw.data.len() >= n, "raw frame shorter than {}x{}", raw.width, raw.height);
+    if raw.data.len() < n {
+        anyhow::bail!("raw frame has {} samples, {}x{} needs {n}", raw.data.len(), raw.width, raw.height);
+    }
     let samples = &raw.data[..n];
     let stamp = info.taken.format("%Y:%m:%d %H:%M:%S").to_string();
     let (matrix, neutral) = colour_matrices(colour);
@@ -216,7 +218,7 @@ pub fn encode(raw: &RawImage, colour: &RawColour, info: &PhotoInfo) -> Vec<u8> {
     for v in samples {
         out.extend_from_slice(&v.to_le_bytes());
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -257,7 +259,7 @@ mod tests {
     #[test]
     fn layout_and_cfa_tags() {
         let r = raw(8, 4);
-        let bytes = encode(&r, &colour(), &info());
+        let bytes = encode(&r, &colour(), &info()).unwrap();
         let e = exif::Reader::new().read_raw(bytes.clone()).expect("valid TIFF");
         assert_eq!((uint(&e, 256, 0), uint(&e, 257, 0), uint(&e, 258, 0)), (8, 4, 16));
         assert_eq!(uint(&e, 262, 0), 32803);
@@ -276,6 +278,13 @@ mod tests {
     }
 
     #[test]
+    fn short_data_is_an_error() {
+        let mut r = raw(4, 2);
+        r.data.truncate(7);
+        assert!(encode(&r, &colour(), &info()).is_err());
+    }
+
+    #[test]
     fn colour_matrix_maps_white_to_the_as_shot_neutral() {
         let (m, neutral) = colour_matrices(&colour());
         assert!((neutral[0] - 1.0 / 1.8).abs() < 1e-6 && (neutral[2] - 1.0 / 1.5).abs() < 1e-6);
@@ -286,7 +295,7 @@ mod tests {
         for c in 0..3 {
             assert!((white[c] / white[1] - neutral[c]).abs() < 1e-6, "{white:?} vs {neutral:?}");
         }
-        let bytes = encode(&raw(4, 2), &colour(), &info());
+        let bytes = encode(&raw(4, 2), &colour(), &info()).unwrap();
         let e = exif::Reader::new().read_raw(bytes).unwrap();
         match &field(&e, 50721).value {
             Value::SRational(v) => {
@@ -303,7 +312,7 @@ mod tests {
         assert_eq!(neutral, [1.0; 3]);
         let white = mul_vec(&m, mul_vec(&SRGB_TO_XYZ, [1.0; 3]));
         assert!(white.iter().all(|v| (v - 1.0).abs() < 1e-6), "{white:?}");
-        let e = exif::Reader::new().read_raw(encode(&raw(4, 2), &RawColour::default(), &info())).unwrap();
+        let e = exif::Reader::new().read_raw(encode(&raw(4, 2), &RawColour::default(), &info()).unwrap()).unwrap();
         assert_eq!(uint(&e, 50714, 0), 0);
     }
 
@@ -318,7 +327,7 @@ mod tests {
         assert_eq!(black_for_cfa(levels, [1, 2, 0, 1]), [30, 40, 10, 20]);
         let mut r = raw(4, 2);
         r.cfa = [2, 1, 1, 0];
-        let e = exif::Reader::new().read_raw(encode(&r, &colour(), &info())).unwrap();
+        let e = exif::Reader::new().read_raw(encode(&r, &colour(), &info()).unwrap()).unwrap();
         assert_eq!((0..4).map(|i| uint(&e, 33422, i)).collect::<Vec<_>>(), vec![2, 1, 1, 0]);
     }
 
@@ -357,7 +366,7 @@ mod tests {
                 ((v.round() as u16) >> 6) << 6
             })
             .collect();
-        std::fs::write(out, encode(&RawImage { width: w, height: h, cfa: RGGB, data }, &c, &info())).unwrap();
+        std::fs::write(out, encode(&RawImage { width: w, height: h, cfa: RGGB, data }, &c, &info()).unwrap()).unwrap();
     }
 
     #[test]

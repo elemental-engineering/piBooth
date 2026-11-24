@@ -37,6 +37,13 @@ pub fn copy_packed(src: &[u8], stride: usize, row_bytes: usize, height: usize, d
     }
 }
 
+/// Whether a raw plane of `len` bytes with rows `stride` bytes apart holds
+/// `width` x `height` 16-bit samples.
+pub fn raw_plane_fits(len: usize, stride: usize, width: u32, height: u32) -> bool {
+    let (w, h) = (width as usize, height as usize);
+    stride >= w * 2 && (h == 0 || len >= stride * (h - 1) + w * 2)
+}
+
 /// Copy a raw Bayer plane (rows `stride` bytes apart, little-endian 16-bit
 /// samples) into tightly packed samples.
 pub fn copy_u16_le(src: &[u8], stride: usize, width: u32, height: u32) -> Vec<u16> {
@@ -153,6 +160,15 @@ mod tests {
         let mut dst = [0; 4];
         copy_packed(&[1, 2, 0, 3, 4], 3, 2, 2, &mut dst);
         assert_eq!(dst, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn raw_plane_fits_checks_stride_and_length() {
+        assert!(raw_plane_fits(10, 6, 2, 2)); // last row needs no padding
+        assert!(raw_plane_fits(12, 6, 2, 2));
+        assert!(!raw_plane_fits(9, 6, 2, 2), "too short");
+        assert!(!raw_plane_fits(100, 3, 2, 2), "stride below row length");
+        assert!(raw_plane_fits(0, 0, 0, 0));
     }
 
     #[test]

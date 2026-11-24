@@ -121,7 +121,10 @@ light through a driver (a MOSFET or relay module for an LED panel, or an
 opto-coupler for a flash unit), never power it directly. `active_high = false`
 inverts the line for drivers that switch on low. Add a pull-down (pull-up when
 inverted) resistor on the driver input so the light stays off while the booth
-is not running. `--no-gpio` disables the strobe and the button.
+is not running. Quitting with Esc/q switches the light off immediately; if the
+booth is stopped or crashes while the light is on (a systemd stop does not
+run the shutdown path), the line can stay driven until the booth starts again,
+which switches it off. `--no-gpio` disables the strobe and the button.
 
 ## Build on the Raspberry Pi 5
 

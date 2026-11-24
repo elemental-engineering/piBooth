@@ -140,7 +140,7 @@ pub fn process(
     // Last, and never fatal: the guests' photo is already safe.
     let clock = Instant::now();
     let dng = job.raw.as_ref().and_then(|raw| {
-        match write_atomic(&dng_path, &dng::encode(&raw.image, &raw.colour, &job.info)) {
+        match dng::encode(&raw.image, &raw.colour, &job.info).and_then(|bytes| write_atomic(&dng_path, &bytes)) {
             Ok(()) => Some(dng_path.clone()),
             Err(e) => {
                 tracing::error!("DNG not saved: {e:#}");
@@ -305,6 +305,19 @@ mod tests {
         std::fs::remove_dir(dir.path().join("raw")).unwrap();
         let mut j = job(true, false);
         j.raw = Some(raw_capture());
+        let done = process(j, &storage, &[], |_| 0).unwrap();
+        assert!(done.photo.exists());
+        assert_eq!(done.dng, None);
+    }
+
+    #[test]
+    fn short_raw_data_keeps_the_photo() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::create(dir.path()).unwrap();
+        let mut j = job(true, false);
+        let mut raw = raw_capture();
+        raw.image.data.truncate(10);
+        j.raw = Some(raw);
         let done = process(j, &storage, &[], |_| 0).unwrap();
         assert!(done.photo.exists());
         assert_eq!(done.dng, None);

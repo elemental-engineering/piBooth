@@ -7,9 +7,10 @@
 //!   aligned to it (integer translation, coarse-to-fine SAD search on a luma
 //!   pyramid), rejected if it moved more than `max_shift` or is exposed
 //!   differently, or if it still does not match the reference after alignment
-//!   (it moved beyond the search window or the scene changed), then averaged pixel by pixel. A pixel of another frame only
-//!   counts where it matches the reference within that frame's noise, so a
-//!   moving guest stays sharp from the reference instead of ghosting.
+//!   (it moved beyond the search window or the scene changed), then averaged
+//!   pixel by pixel. A pixel of another frame only counts where it matches the
+//!   reference within that frame's noise, so a moving guest stays sharp from
+//!   the reference instead of ghosting.
 //! - `off`: the first frame (the photo metered under the flash).
 
 use rayon::prelude::*;

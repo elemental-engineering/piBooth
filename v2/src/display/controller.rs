@@ -362,8 +362,12 @@ impl Controller {
             self.apply(cmds);
             // Frames of another size (never expected) cannot be stacked.
             let CapturedBurst { frames, meta, raw, .. } = b;
+            let total = frames.len();
             let frames: Vec<Vec<u8>> =
                 frames.into_iter().filter(|f| (f.width, f.height) == (width, height)).map(|f| f.data).collect();
+            if frames.len() != total {
+                tracing::warn!(id, dropped = total - frames.len(), "burst frames of another size ignored");
+            }
             self.worker.submit(PhotoJob {
                 id,
                 width,
