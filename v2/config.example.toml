@@ -11,11 +11,10 @@ save_original = true  # keep the unfiltered photo in raw/
 tuning_file = ""      # empty = libcamera default (imx296.json)
 
 [capture]
-# Milestone 3 uses one frame per photo; burst_frames/stack/save_dng arrive in milestone 5.
-burst_frames = 6
-stack = "average"     # average | sharpest | off
-max_shift_px = 8
-save_dng = false
+burst_frames = 6      # frames per photo (1..=12), ~0.15 s at 60 fps
+stack = "average"     # average: less noise | sharpest: least blur | off: first frame only
+max_shift_px = 8      # frames that moved more than this are left out of the average
+save_dng = false      # also save raw/booth_<ts>.dng (3.2 MB each, not uploaded)
 jpeg_quality = 95
 
 [timing]
@@ -31,12 +30,11 @@ assets_dir = "."      # folder containing fonts/, images/ and effects/ (".." whe
 enabled = true
 
 [flash]
-mode = "screen"       # screen | strobe | none
-lead_ms = 300
-max_ms = 800
-gpio_line = 17
-pulse_ms = 150
-active_high = true
+mode = "screen"       # screen | strobe | both | none
+lead_ms = 300         # light on this long before the shot (exposure is metered under it)
+max_ms = 800          # hard limit on the light; it goes off when the burst is in
+gpio_line = 17        # strobe output (BCM), for strobe | both
+active_high = true    # false: the strobe is on when the line is low
 
 [button]
 gpio_line = 27

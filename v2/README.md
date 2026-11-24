@@ -2,11 +2,12 @@
 
 Rewrite of the Python booth (`../main.py`). Design: `../docs/superpowers/specs/2026-11-18-rust-v2-design.md`.
 
-Status: milestone 4 — live preview, button and countdown, screen flash,
-full-quality capture (high-quality noise reduction, exposure metered under the
-flash), sepia + effect overlay, JPEG with EXIF, review of the
-saved photo, status icons, camera auto-restart, and background upload to
-Immich that survives being offline and reboots.
+Status: milestone 5 — live preview, button and countdown, screen flash and/or
+GPIO strobe, full-quality capture (high-quality noise reduction, exposure
+metered under the flash) of a burst stacked into one low-noise photo, sepia +
+effect overlay, JPEG with EXIF, optional DNG raw, review of the saved photo,
+status icons, camera auto-restart, and background upload to Immich that
+survives being offline and reboots.
 
 ## Photos
 
@@ -16,6 +17,25 @@ Every shot is saved under `storage.root` (default: the working directory):
   overlay from `effects/` when the filter is on, plain otherwise).
 - `raw/booth_YYYYMMDD-HHMMSS.jpg` — the unfiltered original
   (`storage.save_original = true`).
+- `raw/booth_YYYYMMDD-HHMMSS.dng` — the sensor's raw data for the first frame
+  (`capture.save_dng = true`; 3.2 MB each, kept on the Pi, not uploaded). Opens
+  in darktable, RawTherapee or Lightroom with the colours the booth used.
+
+Each photo is a burst of `capture.burst_frames` (6) frames taken in about
+0.15 s with exposure and white balance locked:
+
+- `stack = "average"` (default): the frames are lined up with the sharpest one
+  and averaged, which removes most of the grain in dim light. Frames that moved
+  more than `max_shift_px` or came out brighter/darker are left out, and where
+  someone moved between frames the sharpest frame's pixels are kept, so moving
+  hands do not leave ghosts. Frames that do not match after alignment (the booth
+  was bumped hard) are left out too.
+- `stack = "sharpest"`: keep the sharpest frame (rescues motion blur, no
+  noise reduction).
+- `stack = "off"`: the first frame only. With `burst_frames = 1` the camera
+  takes just one frame.
+
+The log line `photo saved … frames=6 averaged=5` tells how many frames were used.
 
 Photos are never mirrored, are 1456×1088 (the sensor's full resolution), JPEG
 quality `capture.jpeg_quality` (95) with full colour detail, and carry EXIF date,
@@ -91,6 +111,17 @@ top-right.
 Same wiring as v1: a push button between GPIO 27 (BCM) and 3.3 V. v2 enables
 the internal pull-down and listens for debounced press edges. For a button to
 ground instead, set `[button] active_low = true` (internal pull-up).
+
+## Strobe
+
+`[flash] mode = "strobe"` (or `"both"` with the white screen) drives GPIO 17
+(BCM) high from `flash.lead_ms` before the shot until the burst is captured
+(about 0.5 s), never longer than `flash.max_ms`. The line can only switch a
+light through a driver (a MOSFET or relay module for an LED panel, or an
+opto-coupler for a flash unit), never power it directly. `active_high = false`
+inverts the line for drivers that switch on low. Add a pull-down (pull-up when
+inverted) resistor on the driver input so the light stays off while the booth
+is not running. `--no-gpio` disables the strobe and the button.
 
 ## Build on the Raspberry Pi 5
 
