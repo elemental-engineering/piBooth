@@ -20,9 +20,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub enum Failure {
     /// Network trouble, timeouts, 408/429 and 5xx: retry with backoff.
     Retry(String),
-    /// 401/403: the key is wrong or lacks permission; every photo would fail.
-    Auth(String),
-    /// Unknown album, rejected file, redirect: needs a human; retried rarely.
+    /// 401/403, a redirect, or 404 on the upload endpoint: the key or
+    /// `base_url` is wrong; every photo would fail, so all uploads pause.
+    Config(String),
+    /// Unknown album, rejected file: this photo needs a human; retried rarely.
     Permanent(String),
 }
 
@@ -30,7 +31,7 @@ impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Failure::Retry(m) => write!(f, "temporary: {m}"),
-            Failure::Auth(m) | Failure::Permanent(m) => write!(f, "needs attention: {m}"),
+            Failure::Config(m) | Failure::Permanent(m) => write!(f, "needs attention: {m}"),
         }
     }
 }
@@ -75,7 +76,7 @@ struct Me {
 pub fn classify(status: u16, body: &str) -> Failure {
     let msg = format!("HTTP {status}: {}", body.chars().take(200).collect::<String>().trim());
     match status {
-        401 | 403 => Failure::Auth(msg),
+        401 | 403 => Failure::Config(msg),
         408 | 429 | 500..=599 => Failure::Retry(msg),
         _ => Failure::Permanent(msg),
     }
@@ -148,7 +149,12 @@ impl Immich {
             .map_err(transport)?;
         let status = resp.status().as_u16();
         if status != 200 && status != 201 {
-            return Err(failed(&mut resp));
+            let f = failed(&mut resp);
+            // A missing upload endpoint means a wrong base_url (not photo specific).
+            return Err(match f {
+                Failure::Permanent(m) if status == 404 => Failure::Config(m),
+                f => f,
+            });
         }
         let r: UploadResponse =
             resp.body_mut().read_json().map_err(|e| Failure::Retry(format!("bad upload response: {e}")))?;
@@ -188,7 +194,7 @@ fn failed(resp: &mut ureq::http::Response<ureq::Body>) -> Failure {
     let status = resp.status().as_u16();
     if (300..400).contains(&status) {
         let location = resp.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or("?");
-        return Failure::Permanent(format!("server redirected to {location}: check immich.base_url"));
+        return Failure::Config(format!("server redirected to {location}: check immich.base_url"));
     }
     classify(status, &resp.body_mut().read_to_string().unwrap_or_default())
 }
@@ -239,7 +245,7 @@ mod tests {
         let c = Immich::new(&format!("{}/api", server.url()), "k", Some("alb"));
         for r in [c.upload(&p, "t").map(|_| ()), c.whoami().map(|_| ()), c.add_to_album(ID)] {
             assert!(
-                matches!(&r, Err(Failure::Permanent(m)) if m.contains("redirected to https://immich.example") && m.contains("immich.base_url")),
+                matches!(&r, Err(Failure::Config(m)) if m.contains("redirected to https://immich.example") && m.contains("immich.base_url")),
                 "{r:?}"
             );
         }
@@ -290,11 +296,11 @@ mod tests {
         let (_d, p) = photo();
         let c = Immich::new(&format!("{}/api", server.url()), "bad", None);
         assert!(
-            matches!(c.upload(&p, "t"), Err(Failure::Auth(m)) if m.contains("401") && m.contains("Invalid API key"))
+            matches!(c.upload(&p, "t"), Err(Failure::Config(m)) if m.contains("401") && m.contains("Invalid API key"))
         );
         assert!(matches!(classify(503, ""), Failure::Retry(_)));
         assert!(matches!(classify(429, ""), Failure::Retry(_)));
-        assert!(matches!(classify(403, ""), Failure::Auth(_)));
+        assert!(matches!(classify(403, ""), Failure::Config(_)));
         assert!(matches!(classify(408, ""), Failure::Retry(_)));
         assert!(matches!(classify(404, ""), Failure::Permanent(_)));
         assert!(matches!(classify(400, ""), Failure::Permanent(_)));
@@ -303,6 +309,17 @@ mod tests {
         assert!(matches!(dead.upload(&p, "t"), Err(Failure::Retry(_))));
         // Missing file: no point retrying.
         assert!(matches!(c.upload(Path::new("/nonexistent.jpg"), "t"), Err(Failure::Permanent(_))));
+    }
+
+    #[test]
+    fn upload_404_is_config_but_album_404_is_per_photo() {
+        let mut server = mockito::Server::new();
+        server.mock("POST", "/api/assets").with_status(404).create();
+        server.mock("PUT", "/api/albums/alb/assets").with_status(404).create();
+        let (_d, p) = photo();
+        let c = Immich::new(&format!("{}/api", server.url()), "k", Some("alb"));
+        assert!(matches!(c.upload(&p, "t"), Err(Failure::Config(_))));
+        assert!(matches!(c.add_to_album(ID), Err(Failure::Permanent(_))));
     }
 
     #[test]
@@ -350,6 +367,6 @@ mod tests {
         server.mock("GET", "/api/users/me").match_header("x-api-key", "bad").with_status(401).create();
         let base = format!("{}/api", server.url());
         assert_eq!(Immich::new(&base, "good", None).whoami(), Ok("Booth <booth@example.com>".into()));
-        assert!(matches!(Immich::new(&base, "bad", None).whoami(), Err(Failure::Auth(_))));
+        assert!(matches!(Immich::new(&base, "bad", None).whoami(), Err(Failure::Config(_))));
     }
 }

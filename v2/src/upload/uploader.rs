@@ -38,7 +38,8 @@ impl Default for Pacing {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UploadStatus {
     pub pending: usize,
-    /// The last failure, cleared by the next success.
+    /// The most recent error of any photo still in the queue (parked photos
+    /// keep theirs visible); `None` once everything went through.
     pub last_error: Option<String>,
 }
 
@@ -140,7 +141,7 @@ fn run(
         let entries = queue.pending();
         pending.store(entries.len(), Ordering::SeqCst);
         let now = unix_now();
-        // A Retry/Auth failure stops the pass with this delay.
+        // A Retry/Config failure stops the pass with this delay.
         let mut stop: Option<Duration> = None;
         // Earliest `next_try` among photos skipped or parked in this pass.
         let mut earliest: Option<u64> = None;
@@ -169,7 +170,6 @@ fn run(
             match result {
                 Ok(()) => {
                     backoff.reset();
-                    *last_error.lock().unwrap() = None;
                     match queue.done(&file) {
                         Ok(()) => {
                             pending.fetch_sub(1, Ordering::SeqCst);
@@ -182,7 +182,7 @@ fn run(
                     entry.last_error = Some(failure.to_string());
                     let d = match &failure {
                         Failure::Retry(_) => backoff.next_delay(),
-                        Failure::Auth(_) | Failure::Permanent(_) => pacing.permanent_retry,
+                        Failure::Config(_) | Failure::Permanent(_) => pacing.permanent_retry,
                     };
                     let park = matches!(failure, Failure::Permanent(_));
                     if park {
@@ -195,7 +195,6 @@ fn run(
                         tracing::error!("{e:#}");
                     }
                     tracing::warn!(photo = %entry.photo.display(), attempts = entry.attempts, "upload failed ({failure}); retry in {d:?}");
-                    *last_error.lock().unwrap() = Some(failure.to_string());
                     if !park {
                         stop = Some(d);
                         break; // keep order: retry the oldest photo first
@@ -205,6 +204,8 @@ fn run(
                 }
             }
         }
+        // Errors of photos still queued stay visible; a success clears only its own.
+        *last_error.lock().unwrap() = queue.pending().into_iter().filter_map(|(_, e)| e.last_error).next_back();
         let alive = match stop {
             Some(d) => wait_retry(wake, running, d),
             None => {
@@ -407,6 +408,43 @@ mod tests {
         std::thread::sleep(300 * MS);
         up.assert();
         assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn upload_404_pauses_all_uploads() {
+        let mut server = mockito::Server::new();
+        let up = server.mock("POST", "/api/assets").with_status(404).expect(1).create();
+        let (_q_dir, q) = setup(2);
+        let slow = Pacing { permanent_retry: Duration::from_secs(60), ..fast() };
+        let u = Uploader::start(q.clone(), Immich::new(&format!("{}/api", server.url()), "k", None), slow).unwrap();
+        wait_until(|| u.status().last_error.is_some());
+        std::thread::sleep(300 * MS);
+        up.assert();
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn parked_error_stays_visible_after_another_photo_succeeds() {
+        let mut server = mockito::Server::new();
+        server
+            .mock("POST", "/api/assets")
+            .match_body(mockito::Matcher::Regex("booth_0.jpg".into()))
+            .with_status(400)
+            .with_body("bad file")
+            .create();
+        server
+            .mock("POST", "/api/assets")
+            .match_body(mockito::Matcher::Regex("booth_1.jpg".into()))
+            .with_status(201)
+            .with_body(format!(r#"{{"id":"{ID}","status":"created"}}"#))
+            .create();
+        let (_dir, q) = setup(2);
+        let slow = Pacing { permanent_retry: Duration::from_secs(60), ..fast() };
+        let u = Uploader::start(q.clone(), Immich::new(&format!("{}/api", server.url()), "k", None), slow).unwrap();
+        wait_until(|| q.len() == 1 && u.status().last_error.is_some());
+        std::thread::sleep(200 * MS);
+        let s = u.status();
+        assert!(s.last_error.as_ref().is_some_and(|e| e.contains("400")), "{s:?}");
     }
 
     #[test]
