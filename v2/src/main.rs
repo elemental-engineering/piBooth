@@ -8,6 +8,7 @@ use std::time::Instant;
 use pibooth::camera::{Camera, SENSOR_FPS, SENSOR_SIZE, fake::FakeCamera};
 use pibooth::config::Config;
 use pibooth::display::{self, CameraFactory, Controller, RunOptions};
+use pibooth::flash::{GpioLine, Strobe};
 use pibooth::input::GpioButton;
 use tracing_subscriber::EnvFilter;
 
@@ -20,7 +21,7 @@ struct Cli {
     /// Use the animated test pattern instead of the Pi camera.
     #[arg(long)]
     fake_camera: bool,
-    /// Disable the GPIO button (keyboard only).
+    /// Disable the GPIO button and strobe (keyboard only, no strobe).
     #[arg(long)]
     no_gpio: bool,
     /// Log display/camera frame rates every second.
@@ -59,8 +60,18 @@ fn main() -> anyhow::Result<()> {
             }
         }
     };
-    let ctrl =
+    let mut ctrl =
         Controller::start(&cfg, camera_factory(&cli, &cfg)?, button, rx, Instant::now()).context("starting camera")?;
+    if cfg.flash.strobe() {
+        let max_on = std::time::Duration::from_millis(cfg.flash.max_ms as u64);
+        match cli.no_gpio {
+            true => tracing::warn!("--no-gpio: running without the strobe"),
+            false => match GpioLine::open(&cfg.flash).and_then(|line| Strobe::start(Box::new(line), max_on)) {
+                Ok(s) => ctrl.set_strobe(s),
+                Err(e) => tracing::warn!("strobe unavailable, running without it: {e:#}"),
+            },
+        }
+    }
     display::run(
         ctrl,
         RunOptions {
@@ -75,12 +86,15 @@ fn main() -> anyhow::Result<()> {
 
 fn camera_factory(cli: &Cli, cfg: &Config) -> anyhow::Result<CameraFactory> {
     if cli.fake_camera {
-        return Ok(Arc::new(|| -> Box<dyn Camera> { Box::new(FakeCamera::new(SENSOR_SIZE, SENSOR_FPS)) }));
+        let raw = cfg.capture.save_dng;
+        return Ok(Arc::new(move || -> Box<dyn Camera> {
+            Box::new(FakeCamera::new(SENSOR_SIZE, SENSOR_FPS).with_raw(raw))
+        }));
     }
     #[cfg(feature = "libcamera")]
     {
-        let cam_cfg = cfg.camera.clone();
-        Ok(Arc::new(move || -> Box<dyn Camera> { Box::new(pibooth::camera::pi::PiCamera::new(cam_cfg.clone())) }))
+        let (cam_cfg, raw) = (cfg.camera.clone(), cfg.capture.save_dng);
+        Ok(Arc::new(move || -> Box<dyn Camera> { Box::new(pibooth::camera::pi::PiCamera::new(cam_cfg.clone(), raw)) }))
     }
     #[cfg(not(feature = "libcamera"))]
     {

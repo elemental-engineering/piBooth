@@ -3,14 +3,13 @@
 //! The machine only decides; the app carries out the returned [`Command`]s.
 //!
 //! Capture flow: `lead` before the deadline the camera is prepared (high
-//! quality noise reduction; screen flash on in screen mode) so auto-exposure
-//! meters the lit scene. At the deadline the next complete frame is the
-//! photo (metered under the flash since the prepare step); the camera then
-//! locks exposure and white balance for the frames after it (used by
-//! milestone 5 bursts). Once the photo arrives the flash goes off, the lock
-//! is released and the photo is processed; review shows the result
-//! or "Oops, try again". Every capture has an id; results for another id are
-//! ignored.
+//! quality noise reduction; flash on unless `flash.mode = "none"`) so
+//! auto-exposure meters the lit scene. At the deadline the camera captures a
+//! burst: the next complete frame (metered under the flash since the prepare
+//! step), then frames with exposure and white balance locked. Once the burst
+//! arrives the flash goes off, the lock is released and the burst is
+//! processed; review shows the result or "Oops, try again". Every capture
+//! has an id; results for another id are ignored.
 
 use std::time::{Duration, Instant};
 
@@ -19,12 +18,14 @@ pub struct Timings {
     pub countdown: Duration,
     pub review: Duration,
     pub idle: Duration,
-    /// Prepare the camera (and turn the screen flash on) this long before the shot.
+    /// Prepare the camera (and turn the flash on) this long before the shot.
     pub prepare_lead: Duration,
-    /// Whether the screen flash is used (`flash.mode = "screen"`).
-    pub screen_flash: bool,
-    /// Longest the screen flash may stay on.
+    /// Whether a flash (screen, strobe or both) is used.
+    pub flash: bool,
+    /// Longest the flash may stay on.
     pub flash_max: Duration,
+    /// Frames per capture (`capture.burst_frames`).
+    pub burst_frames: u32,
     /// Give up on a frame that never arrives.
     pub capture_timeout: Duration,
     /// Give up on processing that never finishes.
@@ -51,7 +52,7 @@ pub enum Phase {
 pub enum Event {
     /// Button or space bar pressed (one edge = one event).
     Press,
-    /// The camera delivered the frame for capture `id`.
+    /// The camera delivered the burst for capture `id`.
     FrameCaptured {
         id: u64,
     },
@@ -71,11 +72,10 @@ pub enum Command {
     PrepareCapture,
     FlashOn,
     FlashOff,
-    /// Deliver the next complete frame as capture `id` (metered under the
-    /// flash since `PrepareCapture`); exposure/white balance are then locked
-    /// for the frames after it.
+    /// Capture a burst of `frames` as capture `id` (see the module docs).
     Capture {
         id: u64,
+        frames: u32,
     },
     /// Back to preview settings: auto exposure/white balance, fast noise reduction.
     ReleaseCapture,
@@ -152,7 +152,7 @@ impl Booth {
             Phase::Countdown { deadline, prepared } => {
                 if !prepared && now + self.timings.prepare_lead >= deadline {
                     out.push(Command::PrepareCapture);
-                    if self.timings.screen_flash {
+                    if self.timings.flash {
                         self.flash_since = Some(now);
                         out.push(Command::FlashOn);
                     }
@@ -162,7 +162,7 @@ impl Booth {
                     let id = self.next_id;
                     self.next_id += 1;
                     self.phase = Phase::Capturing { id, since: now };
-                    out.push(Command::Capture { id });
+                    out.push(Command::Capture { id, frames: self.timings.burst_frames });
                 }
             }
             Phase::Capturing { since, .. } => {
@@ -228,7 +228,8 @@ mod tests {
             review: 5 * S,
             idle: 120 * S,
             prepare_lead: 300 * MS,
-            screen_flash: true,
+            flash: true,
+            burst_frames: 6,
             flash_max: 800 * MS,
             capture_timeout: 5 * S,
             processing_timeout: 10 * S,
@@ -241,7 +242,7 @@ mod tests {
         b.handle(Event::Press, t0);
         b.tick(t0 + 4700 * MS);
         let cmds = b.tick(t0 + 5 * S);
-        let Some(Command::Capture { id }) = cmds.last().copied() else { panic!("{cmds:?}") };
+        let Some(Command::Capture { id, .. }) = cmds.last().copied() else { panic!("{cmds:?}") };
         (b, id)
     }
 
@@ -275,14 +276,14 @@ mod tests {
         assert_eq!(b.tick(t0 + 4700 * MS), vec![Command::PrepareCapture, Command::FlashOn]);
         assert!(b.view(t0 + 4700 * MS).flash);
         assert!(b.tick(t0 + 4800 * MS).is_empty(), "only once");
-        assert_eq!(b.tick(t0 + 5 * S), vec![Command::Capture { id: 1 }]);
+        assert_eq!(b.tick(t0 + 5 * S), vec![Command::Capture { id: 1, frames: 6 }]);
         assert_eq!(b.phase(), Phase::Capturing { id: 1, since: t0 + 5 * S });
     }
 
     #[test]
-    fn without_screen_flash_still_prepares() {
+    fn without_flash_still_prepares() {
         let t0 = Instant::now();
-        let mut b = Booth::new(Timings { screen_flash: false, ..timings() }, t0);
+        let mut b = Booth::new(Timings { flash: false, ..timings() }, t0);
         b.handle(Event::Press, t0);
         assert_eq!(b.tick(t0 + 4700 * MS), vec![Command::PrepareCapture]);
         assert!(!b.view(t0 + 4800 * MS).flash);
@@ -333,7 +334,7 @@ mod tests {
         b.tick(t0 + 10 * S);
         b.handle(Event::Press, t0 + 11 * S);
         b.tick(t0 + 15700 * MS);
-        assert_eq!(b.tick(t0 + 16 * S), vec![Command::Capture { id: first + 1 }]);
+        assert_eq!(b.tick(t0 + 16 * S), vec![Command::Capture { id: first + 1, frames: 6 }]);
     }
 
     #[test]

@@ -8,8 +8,9 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::camera::{Backoff, Camera, CameraCommand, CameraLink, CapturedFrame};
-use crate::config::{Config, FlashMode};
+use crate::camera::{Backoff, Camera, CameraCommand, CameraLink, CapturedBurst};
+use crate::config::{Config, FlashMode, StackMode};
+use crate::flash::Strobe;
 use crate::frame::{Frame, FrameMailbox};
 use crate::input::{Action, GpioButton};
 use crate::monitor::{Monitors, Status};
@@ -61,8 +62,9 @@ pub fn timings_from(cfg: &Config) -> Timings {
         review: Duration::from_secs(cfg.timing.review_s as u64),
         idle: Duration::from_secs(cfg.timing.idle_s as u64),
         prepare_lead: Duration::from_millis(cfg.flash.lead_ms as u64),
-        screen_flash: cfg.flash.mode == FlashMode::Screen,
+        flash: cfg.flash.mode != FlashMode::None,
         flash_max: Duration::from_millis(cfg.flash.max_ms as u64),
+        burst_frames: cfg.capture.burst_frames,
         capture_timeout: CAPTURE_TIMEOUT,
         processing_timeout: PROCESSING_TIMEOUT,
     }
@@ -72,7 +74,7 @@ pub fn timings_from(cfg: &Config) -> Timings {
 struct Running {
     camera: Box<dyn Camera>,
     mailbox: Arc<FrameMailbox>,
-    captures: Receiver<CapturedFrame>,
+    captures: Receiver<CapturedBurst>,
 }
 
 fn start_camera(factory: &CameraFactory) -> anyhow::Result<Running> {
@@ -88,6 +90,10 @@ struct PhotoSettings {
     jpeg_quality: u8,
     save_original: bool,
     gps: Option<(f64, f64)>,
+    stack: StackMode,
+    max_shift_px: u32,
+    /// Draw the white screen while the flash is on.
+    screen_flash: bool,
 }
 
 pub struct Controller {
@@ -107,6 +113,8 @@ pub struct Controller {
     healthy_since: Option<Instant>,
     monitors: Monitors,
     _button: Option<GpioButton>,
+    /// Lit with the flash when `flash.mode` is strobe or both.
+    strobe: Option<Strobe>,
     button_rx: Receiver<Action>,
     worker: Worker,
     queue: Arc<Queue>,
@@ -150,9 +158,6 @@ impl Controller {
         sup: Supervision,
         now: Instant,
     ) -> anyhow::Result<Self> {
-        if cfg.flash.mode == FlashMode::Strobe {
-            tracing::warn!("flash.mode = \"strobe\" arrives in milestone 5; running without flash");
-        }
         let storage = Storage::create(&cfg.storage.root)?;
         let photo_count = storage.photo_count();
         let effects_dir = cfg.display.assets_dir.join("effects");
@@ -199,6 +204,7 @@ impl Controller {
             healthy_since: None,
             monitors: Monitors::start(cfg)?,
             _button: button,
+            strobe: None,
             button_rx,
             worker: Worker::start(storage, effects, Some(queue.clone()))?,
             queue,
@@ -207,6 +213,9 @@ impl Controller {
                 jpeg_quality: cfg.capture.jpeg_quality,
                 save_original: cfg.storage.save_original,
                 gps: cfg.immich.gps(),
+                stack: cfg.capture.stack,
+                max_shift_px: cfg.capture.max_shift_px,
+                screen_flash: cfg.flash.screen(),
             },
             review_image: None,
             photo_count,
@@ -292,6 +301,11 @@ impl Controller {
         }
     }
 
+    /// Light `strobe` together with the flash from now on.
+    pub fn set_strobe(&mut self, strobe: Strobe) {
+        self.strobe = Some(strobe);
+    }
+
     /// The processed photo to show in review, once per photo.
     pub fn take_review_image(&mut self) -> Option<Rgba> {
         self.review_image.take()
@@ -300,7 +314,11 @@ impl Controller {
     pub fn scene_input(&self, now: Instant, screen: (u32, u32)) -> SceneInput {
         SceneInput {
             screen,
-            view: self.booth.view(now),
+            view: {
+                let mut v = self.booth.view(now);
+                v.flash &= self.photo.screen_flash;
+                v
+            },
             status: self.status(),
             debug: self.debug,
             banner: self.cam.is_none(),
@@ -311,9 +329,14 @@ impl Controller {
         for cmd in cmds {
             let camera_cmd = match cmd {
                 // The screen flash is drawn from `View::flash`.
-                Command::FlashOn | Command::FlashOff => continue,
+                Command::FlashOn | Command::FlashOff => {
+                    if let Some(s) = &self.strobe {
+                        s.set(cmd == Command::FlashOn);
+                    }
+                    continue;
+                }
                 Command::PrepareCapture => CameraCommand::PrepareCapture,
-                Command::Capture { id } => CameraCommand::Capture { id },
+                Command::Capture { id, frames } => CameraCommand::Capture { id, frames },
                 Command::ReleaseCapture => CameraCommand::ReleaseCapture,
             };
             if let Some(c) = self.cam.as_mut() {
@@ -324,24 +347,35 @@ impl Controller {
 
     fn collect_captures(&mut self, now: Instant) {
         let Some(c) = &self.cam else { return };
-        let frames: Vec<CapturedFrame> = c.captures.try_iter().collect();
-        for f in frames {
-            let id = f.id;
+        let bursts: Vec<CapturedBurst> = c.captures.try_iter().collect();
+        for b in bursts {
+            let id = b.id;
             if !matches!(self.booth.phase(), Phase::Capturing { id: p, .. } if p == id) {
-                tracing::warn!(id, "unexpected captured frame ignored");
+                tracing::warn!(id, "unexpected captured burst ignored");
                 continue;
             }
+            let Some((width, height)) = b.frames.first().map(|f| (f.width, f.height)) else {
+                tracing::error!(id, "empty burst ignored");
+                continue;
+            };
             let cmds = self.booth.handle(Event::FrameCaptured { id }, now);
             self.apply(cmds);
+            // Frames of another size (never expected) cannot be stacked.
+            let CapturedBurst { frames, meta, raw, .. } = b;
+            let frames: Vec<Vec<u8>> =
+                frames.into_iter().filter(|f| (f.width, f.height) == (width, height)).map(|f| f.data).collect();
             self.worker.submit(PhotoJob {
                 id,
-                width: f.frame.width,
-                height: f.frame.height,
-                rgb: f.frame.data,
+                width,
+                height,
+                frames,
+                stack: self.photo.stack,
+                max_shift_px: self.photo.max_shift_px,
+                raw,
                 info: PhotoInfo {
                     taken: chrono::Local::now().naive_local(),
-                    exposure_us: f.meta.exposure_us,
-                    gain: f.meta.gain,
+                    exposure_us: meta.exposure_us,
+                    gain: meta.gain,
                     gps: self.photo.gps,
                 },
                 filter: self.filter,
@@ -528,10 +562,13 @@ mod tests {
         let t = timings_from(&c);
         assert_eq!(t.countdown, Duration::from_secs(3));
         assert_eq!(t.prepare_lead, Duration::from_millis(250));
-        assert!(t.screen_flash);
+        assert!(t.flash);
+        assert_eq!(t.burst_frames, 6);
+        c.flash.mode = FlashMode::Strobe;
+        assert!(timings_from(&c).flash);
         c.flash.mode = FlashMode::None;
         let t = timings_from(&c);
-        assert!(!t.screen_flash);
+        assert!(!t.flash);
         assert_eq!(t.prepare_lead, Duration::from_millis(250), "camera still prepares without flash");
     }
 
@@ -561,10 +598,64 @@ mod tests {
         run_until(&mut c, |c| c.booth.phase() == Phase::Live);
     }
 
+    #[derive(Clone, Default)]
+    struct Probe(Arc<std::sync::Mutex<Vec<bool>>>);
+    impl crate::flash::Output for Probe {
+        fn set(&mut self, on: bool) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(on);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn strobe_lights_for_the_shot_without_the_screen_flash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = cfg(dir.path());
+        config.flash.mode = FlashMode::Strobe;
+        let (tx, rx) = mpsc::channel();
+        let f = factory(Arc::new(AtomicUsize::new(0)), usize::MAX);
+        let mut c = Controller::start_with(&config, f, None, rx, fast(), Instant::now()).unwrap();
+        let probe = Probe::default();
+        c.set_strobe(Strobe::start(Box::new(probe.clone()), Duration::from_secs(5)).unwrap());
+        tx.send(Action::Press).unwrap();
+        let mut saw_flash = false;
+        run_until(&mut c, |c| {
+            let now = Instant::now();
+            if c.booth.view(now).flash {
+                saw_flash = true;
+                assert!(!c.scene_input(now, (100, 100)).view.flash, "no white screen in strobe mode");
+            }
+            matches!(c.booth.phase(), Phase::Review { .. })
+        });
+        assert!(saw_flash);
+        drop(c); // drops the strobe: its thread has handled every message
+        assert_eq!(probe.0.lock().unwrap()[..3], [false, true, false], "off, lit for the shot, off");
+    }
+
+    #[test]
+    fn save_dng_writes_a_dng_next_to_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = cfg(dir.path());
+        config.capture.save_dng = true;
+        let (tx, rx) = mpsc::channel();
+        let f: CameraFactory =
+            Arc::new(|| -> Box<dyn Camera> { Box::new(FakeCamera::new((64, 48), 100).with_raw(true)) });
+        let mut c = Controller::start_with(&config, f, None, rx, fast(), Instant::now()).unwrap();
+        tx.send(Action::Press).unwrap();
+        run_until(&mut c, |c| matches!(c.booth.phase(), Phase::Review { .. }));
+        assert_eq!(c.booth.view(Instant::now()).review, Some(Outcome::Photo));
+        let dngs: Vec<_> = std::fs::read_dir(dir.path().join("raw"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "dng"))
+            .collect();
+        assert_eq!(dngs.len(), 1);
+    }
+
     /// A fake camera that delivers every capture twice (same id).
     struct DuplicatingCamera {
         inner: FakeCamera,
-        captures: Option<mpsc::Sender<CapturedFrame>>,
+        captures: Option<mpsc::Sender<CapturedBurst>>,
     }
     impl Camera for DuplicatingCamera {
         fn start(&mut self, link: CameraLink) -> anyhow::Result<()> {
@@ -572,10 +663,10 @@ mod tests {
             self.inner.start(link)
         }
         fn command(&mut self, cmd: CameraCommand) {
-            if let (CameraCommand::Capture { id }, Some(tx)) = (cmd, &self.captures) {
+            if let (CameraCommand::Capture { id, .. }, Some(tx)) = (cmd, &self.captures) {
                 let frame =
                     Frame { width: 64, height: 48, data: vec![0; 64 * 48 * 3], seq: 0, captured_at: Instant::now() };
-                let _ = tx.send(CapturedFrame { id, frame, meta: Default::default() });
+                let _ = tx.send(CapturedBurst { id, frames: vec![frame], meta: Default::default(), raw: None });
             }
             self.inner.command(cmd);
         }

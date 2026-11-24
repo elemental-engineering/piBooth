@@ -1,5 +1,6 @@
-//! One photo, start to finish: optional unfiltered original, sepia + random
-//! effect overlay, JPEG with EXIF, atomic writes, and the review image.
+//! One photo, start to finish: burst stacking, optional unfiltered original,
+//! sepia + random effect overlay, JPEG with EXIF, atomic writes, the optional
+//! DNG, and the review image.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -7,19 +8,28 @@ use std::time::Instant;
 use anyhow::Context;
 use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 
+use super::dng;
 use super::exif::{PhotoInfo, build as build_exif};
 use super::filters::{composite, sepia, to_rgba};
+use super::stack::{StackReport, stack};
+use crate::camera::RawCapture;
+use crate::config::StackMode;
 use crate::osd::Rgba;
 use crate::storage::{Storage, write_atomic};
 
-/// A captured frame plus everything needed to turn it into files.
+/// A captured burst plus everything needed to turn it into files.
 #[derive(Debug, Clone)]
 pub struct PhotoJob {
     pub id: u64,
     pub width: u32,
     pub height: u32,
-    /// Tightly packed RGB, row 0 at the top, never mirrored.
-    pub rgb: Vec<u8>,
+    /// Burst frames: tightly packed RGB, row 0 at the top, never mirrored;
+    /// `frames[0]` is the photo metered under the flash. At least one.
+    pub frames: Vec<Vec<u8>>,
+    pub stack: StackMode,
+    pub max_shift_px: u32,
+    /// Written as `raw/<name>.dng` when present (`capture.save_dng`).
+    pub raw: Option<RawCapture>,
     pub info: PhotoInfo,
     pub filter: bool,
     pub jpeg_quality: u8,
@@ -30,11 +40,13 @@ pub struct PhotoJob {
 /// not run is 0).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Timings {
+    pub stack_ms: u64,
     pub encode_original_ms: u64,
     pub write_original_ms: u64,
     pub filter_ms: u64,
     pub encode_photo_ms: u64,
     pub write_photo_ms: u64,
+    pub dng_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +54,8 @@ pub struct PhotoDone {
     pub id: u64,
     pub photo: PathBuf,
     pub original: Option<PathBuf>,
+    pub dng: Option<PathBuf>,
+    pub stack: StackReport,
     /// What the guests see during review: the saved photo as RGBA.
     pub review: Rgba,
     pub timings: Timings,
@@ -68,13 +82,19 @@ pub fn process(
 ) -> anyhow::Result<PhotoDone> {
     let exif = build_exif(&job.info);
     let (photo_path, original_path) = storage.paths_for(job.info.taken);
+    let dng_path = original_path.with_extension("dng"); // raw/<photo name>.dng
 
     let mut t = Timings::default();
     let ms = |since: Instant| since.elapsed().as_millis() as u64;
 
     let clock = Instant::now();
+    let frames = std::mem::take(&mut job.frames);
+    let (mut rgb, report) = stack(frames, job.width, job.height, job.stack, job.max_shift_px);
+    t.stack_ms = ms(clock);
+
+    let clock = Instant::now();
     let plain = if job.save_original || !job.filter {
-        Some(encode_jpeg(&job.rgb, job.width, job.height, job.jpeg_quality, &exif)?)
+        Some(encode_jpeg(&rgb, job.width, job.height, job.jpeg_quality, &exif)?)
     } else {
         None
     };
@@ -91,12 +111,12 @@ pub fn process(
 
     let clock = Instant::now();
     let photo_bytes = if job.filter {
-        sepia(&mut job.rgb);
+        sepia(&mut rgb);
         if !effects.is_empty() {
             let i = pick(effects.len()).min(effects.len() - 1);
             let effect = &effects[i];
             if (effect.width, effect.height) == (job.width, job.height) {
-                composite(&mut job.rgb, effect);
+                composite(&mut rgb, effect);
             } else {
                 tracing::warn!(
                     effect = ?(effect.width, effect.height),
@@ -107,7 +127,7 @@ pub fn process(
         }
         t.filter_ms = ms(clock);
         let clock = Instant::now();
-        let bytes = encode_jpeg(&job.rgb, job.width, job.height, job.jpeg_quality, &exif)?;
+        let bytes = encode_jpeg(&rgb, job.width, job.height, job.jpeg_quality, &exif)?;
         t.encode_photo_ms = ms(clock);
         bytes
     } else {
@@ -117,11 +137,26 @@ pub fn process(
     write_atomic(&photo_path, &photo_bytes)?;
     t.write_photo_ms = ms(clock);
 
+    // Last, and never fatal: the guests' photo is already safe.
+    let clock = Instant::now();
+    let dng = job.raw.as_ref().and_then(|raw| {
+        match write_atomic(&dng_path, &dng::encode(&raw.image, &raw.colour, &job.info)) {
+            Ok(()) => Some(dng_path.clone()),
+            Err(e) => {
+                tracing::error!("DNG not saved: {e:#}");
+                None
+            }
+        }
+    });
+    t.dng_ms = ms(clock);
+
     Ok(PhotoDone {
         id: job.id,
         photo: photo_path,
         original,
-        review: to_rgba(&job.rgb, job.width, job.height),
+        dng,
+        stack: report,
+        review: to_rgba(&rgb, job.width, job.height),
         timings: t,
     })
 }
@@ -137,7 +172,10 @@ mod tests {
             id: 7,
             width: w,
             height: h,
-            rgb: [200u8, 40, 40].repeat((w * h) as usize), // reddish
+            frames: vec![[200u8, 40, 40].repeat((w * h) as usize)], // reddish
+            stack: StackMode::Average,
+            max_shift_px: 8,
+            raw: None,
             info: PhotoInfo {
                 taken: NaiveDateTime::parse_from_str("2026-11-19 14:03:07", "%Y-%m-%d %H:%M:%S").unwrap(),
                 exposure_us: Some(10_000),
@@ -221,6 +259,55 @@ mod tests {
         // Only sepia was applied: the left column carries no blue overlay.
         let edge = decode(&done.photo).get_pixel(0, 8).0;
         assert!(edge[0] > edge[1] && edge[1] > edge[2] && edge[2] < 120, "sepia only, no overlay: {edge:?}");
+    }
+
+    #[test]
+    fn burst_is_stacked_before_filtering() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::create(dir.path()).unwrap();
+        let mut j = job(false, false);
+        let second = j.frames[0].clone();
+        j.frames.push(second);
+        let done = process(j, &storage, &[], |_| 0).unwrap();
+        assert_eq!(done.stack.frames.len(), 2);
+        assert_eq!(done.stack.averaged(), 1);
+        let px = decode(&done.photo).get_pixel(16, 8).0;
+        assert!(px[0] > 180 && px[1] < 70, "same colours after stacking: {px:?}");
+    }
+
+    fn raw_capture() -> RawCapture {
+        use crate::pipeline::dng::{RGGB, RawColour, RawImage};
+        RawCapture {
+            image: RawImage { width: 32, height: 16, cfa: RGGB, data: vec![1 << 6; 32 * 16] },
+            colour: RawColour::default(),
+        }
+    }
+
+    #[test]
+    fn dng_is_saved_next_to_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::create(dir.path()).unwrap();
+        let mut j = job(true, true);
+        j.raw = Some(raw_capture());
+        let done = process(j, &storage, &[], |_| 0).unwrap();
+        let dng = done.dng.expect("dng written");
+        assert!(dng.ends_with("raw/booth_20261119-140307.dng"));
+        let bytes = std::fs::read(&dng).unwrap();
+        assert_eq!(&bytes[..4], b"II\x2a\x00");
+        assert!(bytes.len() > 32 * 16 * 2);
+        assert!(done.timings.dng_ms < 5_000);
+    }
+
+    #[test]
+    fn dng_failure_keeps_the_photo() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::create(dir.path()).unwrap();
+        std::fs::remove_dir(dir.path().join("raw")).unwrap();
+        let mut j = job(true, false);
+        j.raw = Some(raw_capture());
+        let done = process(j, &storage, &[], |_| 0).unwrap();
+        assert!(done.photo.exists());
+        assert_eq!(done.dng, None);
     }
 
     #[test]

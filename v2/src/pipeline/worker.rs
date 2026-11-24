@@ -50,11 +50,17 @@ impl Worker {
                         id,
                         photo = %d.photo.display(),
                         ms = started.elapsed().as_millis() as u64,
+                        frames = d.stack.frames.len(),
+                        averaged = d.stack.averaged(),
+                        reference = d.stack.reference,
+                        stack_ms = d.timings.stack_ms,
                         encode_original_ms = d.timings.encode_original_ms,
                         write_original_ms = d.timings.write_original_ms,
                         filter_ms = d.timings.filter_ms,
                         encode_photo_ms = d.timings.encode_photo_ms,
                         write_photo_ms = d.timings.write_photo_ms,
+                        dng_ms = d.timings.dng_ms,
+                        dng = d.dng.is_some(),
                         "photo saved"
                     ),
                     Err(e) => tracing::error!(id, "photo failed: {e}"),
@@ -107,7 +113,10 @@ mod tests {
             id,
             width: 8,
             height: 4,
-            rgb: vec![128; 8 * 4 * 3],
+            frames: vec![vec![128; 8 * 4 * 3]],
+            stack: crate::config::StackMode::Average,
+            max_shift_px: 8,
+            raw: None,
             info: PhotoInfo { taken: chrono::Local::now().naive_local(), exposure_us: None, gain: None, gps: None },
             filter: true,
             jpeg_quality: 90,
@@ -161,8 +170,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let w = Worker::start(Storage::create(dir.path()).unwrap(), vec![effect_8x4()], None).unwrap();
         let mut bad = job(4);
-        bad.rgb.truncate(5); // frame shorter than width*height*3: composite indexes out of bounds
-        bad.save_original = false; // skip the plain encode so the overlay step is reached
+        bad.frames[0].truncate(5); // frame shorter than width*height*3: stacking asserts
         w.submit(bad);
         let r = wait(&w);
         assert_eq!(r.id, 4);

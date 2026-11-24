@@ -37,6 +37,19 @@ pub fn copy_packed(src: &[u8], stride: usize, row_bytes: usize, height: usize, d
     }
 }
 
+/// Copy a raw Bayer plane (rows `stride` bytes apart, little-endian 16-bit
+/// samples) into tightly packed samples.
+pub fn copy_u16_le(src: &[u8], stride: usize, width: u32, height: u32) -> Vec<u16> {
+    let (w, h) = (width as usize, height as usize);
+    assert!(stride >= w * 2, "stride {stride} < row {}", w * 2);
+    assert!(h == 0 || src.len() >= stride * (h - 1) + w * 2, "src too small");
+    let mut out = Vec::with_capacity(w * h);
+    for y in 0..h {
+        out.extend(src[y * stride..y * stride + w * 2].chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])));
+    }
+    out
+}
+
 /// Spare buffers kept for reuse. Writer + reader + one in flight.
 const MAX_SPARES: usize = 3;
 
@@ -140,6 +153,13 @@ mod tests {
         let mut dst = [0; 4];
         copy_packed(&[1, 2, 0, 3, 4], 3, 2, 2, &mut dst);
         assert_eq!(dst, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn copy_u16_le_strips_padding_and_decodes() {
+        // 2 rows of 2 samples, stride 6 bytes (2 bytes padding).
+        let src = [0x01, 0x02, 0x03, 0x04, 0xEE, 0xEE, 0x05, 0x06, 0x07, 0x08];
+        assert_eq!(copy_u16_le(&src, 6, 2, 2), vec![0x0201, 0x0403, 0x0605, 0x0807]);
     }
 
     #[test]

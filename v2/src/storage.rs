@@ -24,8 +24,9 @@ impl Storage {
         Ok(Self { photos, raw })
     }
 
-    /// Paths for a shot taken at `taken`: (photo, original). A second shot in
-    /// the same second gets a `_2`, `_3`, … suffix instead of overwriting.
+    /// Paths for a shot taken at `taken`: (photo, original); its DNG is the
+    /// original with a `.dng` extension. A second shot in the same second
+    /// gets a `_2`, `_3`, … suffix instead of overwriting any of them.
     /// Single writer only: the photo worker is the sole caller, so the
     /// exists-check and the later write cannot race.
     pub fn paths_for(&self, taken: NaiveDateTime) -> (PathBuf, PathBuf) {
@@ -33,7 +34,7 @@ impl Storage {
         for n in 1.. {
             let name = if n == 1 { format!("{stem}.jpg") } else { format!("{stem}_{n}.jpg") };
             let (p, r) = (self.photos.join(&name), self.raw.join(&name));
-            if !p.exists() && !r.exists() {
+            if !p.exists() && !r.exists() && !r.with_extension("dng").exists() {
                 return (p, r);
             }
         }
@@ -99,6 +100,17 @@ mod tests {
         let (p2, r2) = s.paths_for(t);
         assert!(p2.ends_with("booth_20261119-140307_2.jpg"), "{p2:?}");
         assert!(r2.ends_with("booth_20261119-140307_2.jpg"));
+    }
+
+    #[test]
+    fn a_leftover_dng_also_takes_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::create(dir.path()).unwrap();
+        let t = at("2026-11-19 14:03:07");
+        let (_, r1) = s.paths_for(t);
+        write_atomic(&r1.with_extension("dng"), b"dng").unwrap();
+        let (p2, _) = s.paths_for(t);
+        assert!(p2.ends_with("booth_20261119-140307_2.jpg"), "{p2:?}");
     }
 
     #[test]
