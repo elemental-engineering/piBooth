@@ -40,7 +40,9 @@ Configure (v1's `.env` values move as shown):
 The API key needs the `asset.upload` and `albumAsset.create` permissions (and
 `user.read` for the startup check). At startup the log says `Immich OK user=…`
 or why not. Failures retry from 5 s, doubling to 10 min; a bad key or unknown
-album is retried every 10 min — fix the config and restart, queued photos go up.
+album is retried every 10 min (a bad key or `base_url` pauses all uploads and
+is retried every 10 min, and immediately after a restart) — fix the config and
+queued photos go up within 10 min.
 A new photo does not cut a retry wait short: after a failure the next try is at
 the scheduled retry time.
 `d` shows the queue length and the last upload error, or
@@ -57,7 +59,10 @@ Good to know:
 - A photo that keeps failing is retried every 10 min without blocking the
   others. A wrong key or missing permission (401/403) pauses all uploads for
   10 min; a redirect means `immich.base_url` is wrong (redirects are not
-  followed).
+  followed); so does a 404 on the upload endpoint, and it pauses all uploads
+  like 401/403.
+- Recovery after a crash only looks at `booth_*.jpg` in `photos/`; other JPEGs
+  placed there are ignored.
 - On start, photos that were saved but not queued (power loss between the two
   steps) are queued.
 

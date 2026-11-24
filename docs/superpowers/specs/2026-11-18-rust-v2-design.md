@@ -226,14 +226,17 @@ Milestone 3: one full-resolution RGB frame, processed on the single photo-worker
 - Only `photos/` files are uploaded; `raw/` originals stay local.
 - Failures: transport errors, timeouts, 408/429/5xx ⇒ retry with backoff 5 s →
   10 min; other 4xx (bad key, missing permission, unknown album) ⇒ "needs
-  attention", retried every 10 min. Timeouts: connect 5 s, request 120 s. The
-  oldest photo is always retried first. New photos do not shorten a pending retry
+  attention", retried every 10 min. Timeouts: connect 5 s, request 120 s. Photos
+  are tried oldest first; a photo parked after a permanent error is retried at
+  its `next_try` without blocking the others. New photos do not shorten a pending retry
   wait.
 - Per-photo permanent failures (this photo or its album step) set `next_try`
   (+10 min) in the entry and do not block the other photos; because the asset id
   is stored before the album step, only the album step is retried.
 - 401/403 (bad key, missing permission) pause all uploads for 10 min.
 - 3xx is a configuration error (`base_url`): redirects are not followed.
+  3xx and a 404 on the upload endpoint pause all uploads like 401/403 (album-step
+  404 stays per-photo).
 - Startup reconcile: `queue/.last` holds the newest queued photo's stem; at start,
   photos in `photos/` newer than it without an entry are queued (crash or power
   loss between save and enqueue). Without `.last` nothing is queued, so older
