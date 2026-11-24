@@ -50,7 +50,9 @@ impl Storage {
 
 /// Write `bytes` to `path` via a temporary file in the same folder + rename.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let tmp = path.with_extension("jpg.part");
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".part"); // photo.jpg → photo.jpg.part, entry.json → entry.json.part
+    let tmp = std::path::PathBuf::from(tmp);
     let mut f = std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     let result = f
         .write_all(bytes)
