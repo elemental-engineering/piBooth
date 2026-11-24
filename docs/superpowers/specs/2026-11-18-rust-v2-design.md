@@ -182,7 +182,9 @@ The photo worker processes one burst (+ optional raw frame) per job, with stacki
      rejected; otherwise its integer translation is found by minimising the
      mean absolute luma difference — full search at quarter resolution (±⌈max/4⌉+1),
      refined ±1 at half and full resolution — and frames whose shift exceeds
-     `capture.max_shift_px` (default 8, max 32) are rejected. The rest are
+     `capture.max_shift_px` (default 8, max 32) are rejected, as are frames
+     whose unclamped 3σ (below) exceeds 60 after alignment (moved beyond the
+     search window, or the scene changed). The rest are
      averaged per pixel in `u16` accumulators, counting a frame's pixel only
      where its luma is within 3σ of the reference (σ from the median absolute
      difference, clamped to 10–60 levels): moving subjects keep the
