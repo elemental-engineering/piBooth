@@ -12,7 +12,7 @@ use ureq::unversioned::multipart::{Form, Part};
 
 const DEVICE_ID: &str = "piBooth";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// A 1.5 MP JPEG is ~0.3 MB; generous for slow Wi-Fi.
+/// A q95 4:4:4 1.5 MP JPEG is ~0.3–1 MB; generous for slow Wi-Fi.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Why a call failed, and whether trying again later can help.
@@ -20,8 +20,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub enum Failure {
     /// Network trouble, timeouts, 408/429 and 5xx: retry with backoff.
     Retry(String),
-    /// Wrong key, missing permission, unknown album, rejected file: needs a
-    /// human; retried rarely.
+    /// 401/403: the key is wrong or lacks permission; every photo would fail.
+    Auth(String),
+    /// Unknown album, rejected file, redirect: needs a human; retried rarely.
     Permanent(String),
 }
 
@@ -29,7 +30,7 @@ impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Failure::Retry(m) => write!(f, "temporary: {m}"),
-            Failure::Permanent(m) => write!(f, "needs attention: {m}"),
+            Failure::Auth(m) | Failure::Permanent(m) => write!(f, "needs attention: {m}"),
         }
     }
 }
@@ -74,6 +75,7 @@ struct Me {
 pub fn classify(status: u16, body: &str) -> Failure {
     let msg = format!("HTTP {status}: {}", body.chars().take(200).collect::<String>().trim());
     match status {
+        401 | 403 => Failure::Auth(msg),
         408 | 429 | 500..=599 => Failure::Retry(msg),
         _ => Failure::Permanent(msg),
     }
@@ -86,6 +88,8 @@ impl Immich {
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(REQUEST_TIMEOUT))
             .http_status_as_error(false)
+            // A redirect means a wrong base_url (http vs https, missing /api).
+            .max_redirects(0)
             // The Pi's certificate store: works with a private CA too.
             .tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
             .build()
@@ -113,7 +117,7 @@ impl Immich {
             .map_err(transport)?;
         let status = resp.status().as_u16();
         if status != 200 {
-            return Err(classify(status, &resp.body_mut().read_to_string().unwrap_or_default()));
+            return Err(failed(&mut resp));
         }
         let me: Me = resp.body_mut().read_json().map_err(|e| Failure::Retry(format!("bad response: {e}")))?;
         Ok(format!("{} <{}>", me.name, me.email))
@@ -144,7 +148,7 @@ impl Immich {
             .map_err(transport)?;
         let status = resp.status().as_u16();
         if status != 200 && status != 201 {
-            return Err(classify(status, &resp.body_mut().read_to_string().unwrap_or_default()));
+            return Err(failed(&mut resp));
         }
         let r: UploadResponse =
             resp.body_mut().read_json().map_err(|e| Failure::Retry(format!("bad upload response: {e}")))?;
@@ -164,7 +168,7 @@ impl Immich {
             .map_err(transport)?;
         let status = resp.status().as_u16();
         if status != 200 {
-            return Err(classify(status, &resp.body_mut().read_to_string().unwrap_or_default()));
+            return Err(failed(&mut resp));
         }
         let results: Vec<BulkIdResponse> =
             resp.body_mut().read_json().map_err(|e| Failure::Retry(format!("bad album response: {e}")))?;
@@ -177,6 +181,16 @@ impl Immich {
             None => Err(Failure::Retry("empty album response".into())),
         }
     }
+}
+
+/// Failure for a non-success response, with 3xx reported as a config error.
+fn failed(resp: &mut ureq::http::Response<ureq::Body>) -> Failure {
+    let status = resp.status().as_u16();
+    if (300..400).contains(&status) {
+        let location = resp.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or("?");
+        return Failure::Permanent(format!("server redirected to {location}: check immich.base_url"));
+    }
+    classify(status, &resp.body_mut().read_to_string().unwrap_or_default())
 }
 
 fn transport(e: ureq::Error) -> Failure {
@@ -195,6 +209,28 @@ mod tests {
         let p = dir.path().join("booth_20261119-185907.jpg");
         std::fs::write(&p, b"\xFF\xD8fake-jpeg\xFF\xD9").unwrap();
         (dir, p)
+    }
+
+    /// A URL on a port nothing listens on.
+    fn dead_url() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://127.0.0.1:{}/api", l.local_addr().unwrap().port())
+    }
+
+    #[test]
+    fn redirects_are_configuration_errors() {
+        let mut server = mockito::Server::new();
+        server.mock("POST", "/api/assets").with_status(301).with_header("location", "https://immich.example/api/assets").create();
+        server.mock("GET", "/api/users/me").with_status(301).with_header("location", "https://immich.example/api/users/me").create();
+        server.mock("PUT", "/api/albums/alb/assets").with_status(301).with_header("location", "https://immich.example/x").create();
+        let (_d, p) = photo();
+        let c = Immich::new(&format!("{}/api", server.url()), "k", Some("alb"));
+        for r in [c.upload(&p, "t").map(|_| ()), c.whoami().map(|_| ()), c.add_to_album(ID)] {
+            assert!(
+                matches!(&r, Err(Failure::Permanent(m)) if m.contains("redirected to https://immich.example") && m.contains("immich.base_url")),
+                "{r:?}"
+            );
+        }
     }
 
     #[test]
@@ -242,13 +278,16 @@ mod tests {
         let (_d, p) = photo();
         let c = Immich::new(&format!("{}/api", server.url()), "bad", None);
         assert!(
-            matches!(c.upload(&p, "t"), Err(Failure::Permanent(m)) if m.contains("401") && m.contains("Invalid API key"))
+            matches!(c.upload(&p, "t"), Err(Failure::Auth(m)) if m.contains("401") && m.contains("Invalid API key"))
         );
         assert!(matches!(classify(503, ""), Failure::Retry(_)));
         assert!(matches!(classify(429, ""), Failure::Retry(_)));
+        assert!(matches!(classify(403, ""), Failure::Auth(_)));
+        assert!(matches!(classify(408, ""), Failure::Retry(_)));
         assert!(matches!(classify(404, ""), Failure::Permanent(_)));
+        assert!(matches!(classify(400, ""), Failure::Permanent(_)));
         // Nothing listening: a network failure, retried.
-        let dead = Immich::new("http://127.0.0.1:9/api", "k", None);
+        let dead = Immich::new(&dead_url(), "k", None);
         assert!(matches!(dead.upload(&p, "t"), Err(Failure::Retry(_))));
         // Missing file: no point retrying.
         assert!(matches!(c.upload(Path::new("/nonexistent.jpg"), "t"), Err(Failure::Permanent(_))));
@@ -284,7 +323,7 @@ mod tests {
         let r = Immich::new(&format!("{}/api", server.url()), "k", Some("alb-3")).add_to_album(ID);
         assert!(matches!(r, Err(Failure::Permanent(m)) if m.contains("no_permission")));
 
-        assert_eq!(Immich::new("http://127.0.0.1:9/api", "k", None).add_to_album(ID), Ok(()), "no album: no call");
+        assert_eq!(Immich::new(&dead_url(), "k", None).add_to_album(ID), Ok(()), "no album: no call");
     }
 
     #[test]
@@ -299,6 +338,6 @@ mod tests {
         server.mock("GET", "/api/users/me").match_header("x-api-key", "bad").with_status(401).create();
         let base = format!("{}/api", server.url());
         assert_eq!(Immich::new(&base, "good", None).whoami(), Ok("Booth <booth@example.com>".into()));
-        assert!(matches!(Immich::new(&base, "bad", None).whoami(), Err(Failure::Permanent(_))));
+        assert!(matches!(Immich::new(&base, "bad", None).whoami(), Err(Failure::Auth(_))));
     }
 }

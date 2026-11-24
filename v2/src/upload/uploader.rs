@@ -57,7 +57,17 @@ impl Uploader {
         let last_error = Arc::new(Mutex::new(None));
         let (r, p, e) = (running.clone(), pending.clone(), last_error.clone());
         std::thread::Builder::new().name("uploader".into()).spawn(move || {
-            run(&queue, &client, pacing, &wake_rx, &r, &p, &e);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(&queue, &client, pacing, &wake_rx, &r, &p, &e);
+            }));
+            if let Err(payload) = outcome {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".into());
+                tracing::error!("upload thread stopped after a panic: {msg}");
+            }
         })?;
         Ok(Self { wake, running, pending, last_error })
     }
@@ -129,22 +139,34 @@ fn run(
     while running.load(Ordering::SeqCst) {
         let entries = queue.pending();
         pending.store(entries.len(), Ordering::SeqCst);
-        let mut delay = None;
+        let now = unix_now();
+        // A Retry/Auth failure stops the pass with this delay.
+        let mut stop: Option<Duration> = None;
+        // Earliest `next_try` among photos skipped or parked in this pass.
+        let mut earliest: Option<u64> = None;
         for (file, mut entry) in entries {
             if !running.load(Ordering::SeqCst) {
                 return;
             }
-            if !entry.photo.exists() {
-                tracing::warn!(photo = %entry.photo.display(), "queued photo no longer exists; dropping it from the queue");
-                match queue.done(&file) {
-                    Ok(()) => {
-                        pending.fetch_sub(1, Ordering::SeqCst);
-                    }
-                    Err(e) => tracing::error!("{e:#}"),
-                }
+            if let Some(t) = entry.next_try.filter(|t| *t > now) {
+                earliest = Some(earliest.map_or(t, |e| e.min(t)));
                 continue;
             }
-            match send(client, queue, &file, &mut entry) {
+            let result = match entry.photo.try_exists() {
+                Ok(true) => send(client, queue, &file, &mut entry),
+                Ok(false) => {
+                    tracing::warn!(photo = %entry.photo.display(), "queued photo no longer exists; dropping it from the queue");
+                    match queue.done(&file) {
+                        Ok(()) => {
+                            pending.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        Err(e) => tracing::error!("{e:#}"),
+                    }
+                    continue;
+                }
+                Err(e) => Err(Failure::Retry(format!("cannot check {}: {e}", entry.photo.display()))),
+            };
+            match result {
                 Ok(()) => {
                     backoff.reset();
                     *last_error.lock().unwrap() = None;
@@ -158,28 +180,47 @@ fn run(
                 Err(failure) => {
                     entry.attempts += 1;
                     entry.last_error = Some(failure.to_string());
+                    let d = match &failure {
+                        Failure::Retry(_) => backoff.next_delay(),
+                        Failure::Auth(_) | Failure::Permanent(_) => pacing.permanent_retry,
+                    };
+                    let park = matches!(failure, Failure::Permanent(_));
+                    if park {
+                        // Whole seconds, rounded up, so a short test delay still parks.
+                        let t = now + d.as_secs() + u64::from(d.subsec_nanos() > 0);
+                        entry.next_try = Some(t);
+                        earliest = Some(earliest.map_or(t, |e| e.min(t)));
+                    }
                     if let Err(e) = queue.update(&file, &entry) {
                         tracing::error!("{e:#}");
                     }
-                    let d = match &failure {
-                        Failure::Retry(_) => backoff.next_delay(),
-                        Failure::Permanent(_) => pacing.permanent_retry,
-                    };
                     tracing::warn!(photo = %entry.photo.display(), attempts = entry.attempts, "upload failed ({failure}); retry in {d:?}");
                     *last_error.lock().unwrap() = Some(failure.to_string());
-                    delay = Some(d);
-                    break; // keep order: retry the oldest photo first
+                    if !park {
+                        stop = Some(d);
+                        break; // keep order: retry the oldest photo first
+                    }
+                    // This photo (or its album step) is the problem, not the
+                    // server: carry on with the next one.
                 }
             }
         }
-        let alive = match delay {
+        let alive = match stop {
             Some(d) => wait_retry(wake, running, d),
-            None => wait_idle(wake, running, pacing.idle_rescan),
+            None => {
+                let wait = earliest
+                    .map_or(pacing.idle_rescan, |t| Duration::from_secs(t.saturating_sub(unix_now())).min(pacing.idle_rescan));
+                wait_idle(wake, running, wait)
+            }
         };
         if !alive {
             return;
         }
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// Upload (if not done yet) and add to the album, recording progress so a
@@ -205,6 +246,12 @@ mod tests {
 
     fn fast() -> Pacing {
         Pacing { retry_initial: 20 * MS, retry_max: 80 * MS, permanent_retry: 200 * MS, idle_rescan: 50 * MS }
+    }
+
+    /// A URL on a port nothing listens on.
+    fn dead_url() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://127.0.0.1:{}/api", l.local_addr().unwrap().port())
     }
 
     fn setup(n: usize) -> (tempfile::TempDir, Arc<Queue>) {
@@ -254,7 +301,7 @@ mod tests {
     #[test]
     fn offline_keeps_photos_and_records_attempts() {
         let (_dir, q) = setup(1);
-        let u = Uploader::start(q.clone(), Immich::new("http://127.0.0.1:9/api", "k", None), fast()).unwrap();
+        let u = Uploader::start(q.clone(), Immich::new(&dead_url(), "k", None), fast()).unwrap();
         wait_until(|| q.pending()[0].1.attempts >= 2);
         let s = u.status();
         assert_eq!(s.pending, 1);
@@ -303,10 +350,67 @@ mod tests {
     }
 
     #[test]
+    fn permanent_failure_skips_to_next_photo() {
+        let mut server = mockito::Server::new();
+        // Matches the first photo (booth_0) by its form field.
+        server
+            .mock("POST", "/api/assets")
+            .match_body(mockito::Matcher::Regex("booth_0.jpg".into()))
+            .with_status(400)
+            .with_body("bad file")
+            .create();
+        server
+            .mock("POST", "/api/assets")
+            .match_body(mockito::Matcher::Regex("booth_1.jpg".into()))
+            .with_status(201)
+            .with_body(format!(r#"{{"id":"{ID}","status":"created"}}"#))
+            .expect(1)
+            .create();
+        let (_dir, q) = setup(2);
+        let _u = Uploader::start(q.clone(), Immich::new(&format!("{}/api", server.url()), "k", None), fast()).unwrap();
+        wait_until(|| q.len() == 1 && q.pending().first().is_some_and(|(_, e)| e.attempts >= 1));
+        let (f, e) = q.pending().remove(0);
+        assert_eq!(f.file_name().unwrap(), "booth_0.json");
+        assert!(e.next_try.is_some());
+        assert!(e.last_error.unwrap().contains("400"));
+    }
+
+    #[test]
+    fn bad_album_still_uploads_all_photos() {
+        let mut server = mockito::Server::new();
+        let up = server
+            .mock("POST", "/api/assets")
+            .with_status(201)
+            .with_body(format!(r#"{{"id":"{ID}","status":"created"}}"#))
+            .expect(3)
+            .create();
+        server.mock("PUT", "/api/albums/alb/assets").with_status(404).create();
+        let (_dir, q) = setup(3);
+        let _u = Uploader::start(q.clone(), Immich::new(&format!("{}/api", server.url()), "k", Some("alb")), fast())
+            .unwrap();
+        wait_until(|| q.pending().len() == 3 && q.pending().iter().all(|(_, e)| e.asset_id.is_some() && e.attempts >= 1));
+        std::thread::sleep(300 * MS); // would re-upload if the asset id were ignored
+        up.assert();
+    }
+
+    #[test]
+    fn auth_failure_stops_the_pass() {
+        let mut server = mockito::Server::new();
+        let up = server.mock("POST", "/api/assets").with_status(401).with_body("nope").expect(1).create();
+        let (_dir, q) = setup(2);
+        let slow = Pacing { permanent_retry: Duration::from_secs(60), ..fast() };
+        let u = Uploader::start(q.clone(), Immich::new(&format!("{}/api", server.url()), "k", None), slow).unwrap();
+        wait_until(|| u.status().last_error.is_some());
+        std::thread::sleep(300 * MS);
+        up.assert();
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
     fn wake_does_not_cut_backoff() {
         let (_dir, q) = setup(1);
         let slow = Pacing { retry_initial: 400 * MS, retry_max: 400 * MS, ..fast() };
-        let u = Uploader::start(q.clone(), Immich::new("http://127.0.0.1:9/api", "k", None), slow).unwrap();
+        let u = Uploader::start(q.clone(), Immich::new(&dead_url(), "k", None), slow).unwrap();
         wait_until(|| q.pending()[0].1.attempts >= 1);
         for _ in 0..5 {
             u.wake();

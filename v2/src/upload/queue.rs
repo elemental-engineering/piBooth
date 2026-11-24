@@ -22,6 +22,10 @@ pub struct Entry {
     pub attempts: u32,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Do not try again before this Unix time (seconds): set after a failure
+    /// that only this photo causes, so it does not block the others.
+    #[serde(default)]
+    pub next_try: Option<u64>,
 }
 
 /// Local wall-clock time of the shot → RFC 3339 UTC with milliseconds
@@ -54,7 +58,7 @@ impl Queue {
         let stem = photo.file_stem().context("photo path has no file name")?;
         let file = self.dir.join(stem).with_extension("json");
         let photo = photo.canonicalize().unwrap_or_else(|_| photo.to_path_buf());
-        let entry = Entry { photo, taken: taken.to_string(), asset_id: None, attempts: 0, last_error: None };
+        let entry = Entry { photo, taken: taken.to_string(), asset_id: None, attempts: 0, last_error: None, next_try: None };
         self.update(&file, &entry)?;
         Ok(file)
     }
@@ -179,6 +183,6 @@ mod tests {
         let q = Queue::open(dir.path()).unwrap();
         std::fs::write(dir.path().join("queue/booth_0.json"), br#"{"photo":"/x.jpg","taken":"t"}"#).unwrap();
         let e = &q.pending()[0].1;
-        assert_eq!((e.asset_id.clone(), e.attempts), (None, 0));
+        assert_eq!((e.asset_id.clone(), e.attempts, e.next_try), (None, 0, None));
     }
 }
