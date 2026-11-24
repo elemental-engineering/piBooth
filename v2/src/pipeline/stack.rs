@@ -6,7 +6,8 @@
 //! - `average`: the sharpest frame is the reference; every other frame is
 //!   aligned to it (integer translation, coarse-to-fine SAD search on a luma
 //!   pyramid), rejected if it moved more than `max_shift` or is exposed
-//!   differently, then averaged pixel by pixel. A pixel of another frame only
+//!   differently, or if it still does not match the reference after alignment
+//!   (it moved beyond the search window or the scene changed), then averaged pixel by pixel. A pixel of another frame only
 //!   counts where it matches the reference within that frame's noise, so a
 //!   moving guest stays sharp from the reference instead of ghosting.
 //! - `off`: the first frame (the photo metered under the flash).
@@ -34,6 +35,9 @@ pub enum FrameUse {
         dy: i32,
     },
     Brightness,
+    /// Does not match the reference after alignment: moved beyond the search
+    /// window or the scene changed.
+    Mismatch,
     /// Not looked at (`sharpest` / `off`).
     Unused,
 }
@@ -172,11 +176,11 @@ fn estimate_shift(reference: &Pyramid, frame: &Pyramid, max_shift: u32) -> (i32,
 /// Luma difference a frame's pixel may have from the reference and still be
 /// averaged: three times the noise of the difference (robust median
 /// estimate), within [`MIN_MATCH`, `MAX_MATCH`].
-fn match_threshold(reference: &Plane, frame: &Plane, (dx, dy): (i32, i32)) -> u8 {
+fn match_threshold(reference: &Plane, frame: &Plane, (dx, dy): (i32, i32)) -> Option<u8> {
     let mut hist = [0u64; 256];
     let margin = dx.unsigned_abs().max(dy.unsigned_abs()) as usize + 1;
     if reference.w <= 2 * margin || reference.h <= 2 * margin {
-        return MIN_MATCH;
+        return Some(MIN_MATCH);
     }
     let mut n = 0u64;
     for y in (margin..reference.h - margin).step_by(4) {
@@ -195,7 +199,8 @@ fn match_threshold(reference: &Plane, frame: &Plane, (dx, dy): (i32, i32)) -> u8
         })
         .unwrap_or(0);
     let sigma = 1.4826 * median as f64;
-    (3.0 * sigma).round().clamp(MIN_MATCH as f64, MAX_MATCH as f64) as u8
+    let t = (3.0 * sigma).round();
+    (t <= MAX_MATCH as f64).then(|| t.max(MIN_MATCH as f64) as u8)
 }
 
 /// Combine a burst of tightly packed RGB frames (same size) into one image.
@@ -242,7 +247,10 @@ pub fn stack(
             if dx.unsigned_abs() > max_shift || dy.unsigned_abs() > max_shift {
                 return (FrameUse::TooFar { dx, dy }, 0);
             }
-            (FrameUse::Averaged { dx, dy }, match_threshold(&ref_pyr.levels[0], &p.levels[0], (dx, dy)))
+            match match_threshold(&ref_pyr.levels[0], &p.levels[0], (dx, dy)) {
+                Some(t) => (FrameUse::Averaged { dx, dy }, t),
+                None => (FrameUse::Mismatch, 0),
+            }
         })
         .collect();
     let mut used: Vec<(usize, i32, i32, u8)> = Vec::new();
@@ -296,7 +304,7 @@ mod tests {
 
     const W: u32 = 160;
     const H: u32 = 120;
-    const PAD: i32 = 16;
+    const PAD: i32 = 48;
 
     /// Smooth random texture (value noise on an 8-px grid) plus fine detail,
     /// `PAD` pixels bigger than the frame on every side.
@@ -415,16 +423,28 @@ mod tests {
     }
 
     #[test]
+    fn far_moved_frames_are_not_averaged() {
+        let sc = scene(13);
+        let mut rng = fastrand::Rng::with_seed(14);
+        let far = blur(&view(&sc, 40, 0, 4, &mut rng));
+        let frames = vec![view(&sc, 0, 0, 4, &mut rng), view(&sc, 1, 0, 4, &mut rng), far];
+        let (_, report) = stack(frames, W, H, StackMode::Average, 8);
+        assert_ne!(report.reference, 2);
+        assert!(matches!(report.frames[2], FrameUse::TooFar { .. } | FrameUse::Mismatch), "{report:?}");
+        assert_eq!(report.averaged(), 1);
+    }
+
+    #[test]
     fn differently_exposed_frames_are_rejected() {
         let sc = scene(7);
         let mut rng = fastrand::Rng::with_seed(8);
         let a = view(&sc, 0, 0, 2, &mut rng);
         let bright: Vec<u8> = a.iter().map(|&v| (v as u16 * 5 / 4).min(255) as u8).collect();
-        let (out, report) = stack(vec![a.clone(), bright], W, H, StackMode::Average, 8);
+        let originals = vec![a, bright];
+        let (out, report) = stack(originals.clone(), W, H, StackMode::Average, 8);
         assert!(report.frames.contains(&FrameUse::Brightness), "{report:?}");
         assert_eq!(report.averaged(), 0);
-        let reference_frame = if report.reference == 0 { &a } else { &out };
-        assert_eq!(&out, reference_frame);
+        assert_eq!(out, originals[report.reference]);
     }
 
     #[test]
