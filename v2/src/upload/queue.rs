@@ -163,7 +163,11 @@ impl Queue {
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|x| x == "json"))
             .collect();
-        files.sort();
+        // Oldest first; `_10` after `_9` (other names first, by name).
+        files.sort_by_cached_key(|f| {
+            let stem = f.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            (booth_key(&stem).map(|(ts, n)| (ts.to_owned(), n)), stem)
+        });
         files
             .into_iter()
             .filter_map(|f| {
@@ -357,6 +361,8 @@ mod tests {
         assert_eq!(last(dir.path()).as_deref(), Some("booth_20261119-190000_10"));
         assert_eq!(booth_key("booth_X"), Some(("X", 1)));
         assert!(booth_key("booth_X_10") > booth_key("booth_X_9"));
+        let order: Vec<_> = q.pending().into_iter().map(|(f, _)| f.file_stem().unwrap().to_owned()).collect();
+        assert_eq!(order.last().unwrap(), "booth_20261119-190000_10");
     }
 
     #[test]
