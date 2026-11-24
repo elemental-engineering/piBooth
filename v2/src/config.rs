@@ -170,6 +170,13 @@ impl Default for Monitor {
     }
 }
 
+fn looks_like_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.chars()
+            .enumerate()
+            .all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() })
+}
+
 impl Config {
     /// Parse TOML text and validate. Does not touch the environment.
     pub fn from_toml_str(text: &str) -> anyhow::Result<Self> {
@@ -216,6 +223,13 @@ impl Config {
         let (lat, lon) = (self.immich.latitude, self.immich.longitude);
         if !lat.is_finite() || !lon.is_finite() || lat.abs() > 90.0 || lon.abs() > 180.0 {
             bail!("immich.latitude must be within +-90 and immich.longitude within +-180");
+        }
+        let url = &self.immich.base_url;
+        if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
+            bail!("immich.base_url must start with http:// or https://");
+        }
+        if !self.immich.album_id.is_empty() && !looks_like_uuid(&self.immich.album_id) {
+            bail!("immich.album_id must be a UUID like 4c1d8f6e-0b2a-4f6e-9a7c-2d4e6f8a0b1c");
         }
         if self.flash.lead_ms > self.flash.max_ms {
             bail!("flash.lead_ms must be <= flash.max_ms");
@@ -303,6 +317,11 @@ mod tests {
         assert!(Config::from_toml_str("[immich]\nlatitude = nan\n").is_err());
         assert!(Config::from_toml_str("[immich]\nlatitude = 90.5\n").is_err());
         assert!(Config::from_toml_str("[immich]\nlongitude = -180.5\n").is_err());
+        assert!(Config::from_toml_str("[immich]\nbase_url = \"immich.example/api\"\n").is_err());
+        assert!(Config::from_toml_str("[immich]\nbase_url = \"https://immich.example/api\"\n").is_ok());
+        assert!(Config::from_toml_str("[immich]\nalbum_id = \"my-album\"\n").is_err());
+        assert!(Config::from_toml_str("[immich]\nalbum_id = \"4c1d8f6e-0b2a-4f6e-9a7c-2d4e6f8a0b1g\"\n").is_err());
+        assert!(Config::from_toml_str("[immich]\nalbum_id = \"4c1d8f6e-0b2a-4f6e-9a7c-2d4e6f8a0b1c\"\n").is_ok());
     }
 
     #[test]

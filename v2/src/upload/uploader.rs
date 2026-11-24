@@ -208,8 +208,9 @@ fn run(
         let alive = match stop {
             Some(d) => wait_retry(wake, running, d),
             None => {
-                let wait = earliest
-                    .map_or(pacing.idle_rescan, |t| Duration::from_secs(t.saturating_sub(unix_now())).min(pacing.idle_rescan));
+                let wait = earliest.map_or(pacing.idle_rescan, |t| {
+                    Duration::from_secs(t.saturating_sub(unix_now())).min(pacing.idle_rescan)
+                });
                 wait_idle(wake, running, wait)
             }
         };
@@ -388,7 +389,9 @@ mod tests {
         let (_dir, q) = setup(3);
         let _u = Uploader::start(q.clone(), Immich::new(&format!("{}/api", server.url()), "k", Some("alb")), fast())
             .unwrap();
-        wait_until(|| q.pending().len() == 3 && q.pending().iter().all(|(_, e)| e.asset_id.is_some() && e.attempts >= 1));
+        wait_until(|| {
+            q.pending().len() == 3 && q.pending().iter().all(|(_, e)| e.asset_id.is_some() && e.attempts >= 1)
+        });
         std::thread::sleep(300 * MS); // would re-upload if the asset id were ignored
         up.assert();
     }

@@ -220,9 +220,21 @@ mod tests {
     #[test]
     fn redirects_are_configuration_errors() {
         let mut server = mockito::Server::new();
-        server.mock("POST", "/api/assets").with_status(301).with_header("location", "https://immich.example/api/assets").create();
-        server.mock("GET", "/api/users/me").with_status(301).with_header("location", "https://immich.example/api/users/me").create();
-        server.mock("PUT", "/api/albums/alb/assets").with_status(301).with_header("location", "https://immich.example/x").create();
+        server
+            .mock("POST", "/api/assets")
+            .with_status(301)
+            .with_header("location", "https://immich.example/api/assets")
+            .create();
+        server
+            .mock("GET", "/api/users/me")
+            .with_status(301)
+            .with_header("location", "https://immich.example/api/users/me")
+            .create();
+        server
+            .mock("PUT", "/api/albums/alb/assets")
+            .with_status(301)
+            .with_header("location", "https://immich.example/x")
+            .create();
         let (_d, p) = photo();
         let c = Immich::new(&format!("{}/api", server.url()), "k", Some("alb"));
         for r in [c.upload(&p, "t").map(|_| ()), c.whoami().map(|_| ()), c.add_to_album(ID)] {
