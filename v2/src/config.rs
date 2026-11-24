@@ -109,6 +109,8 @@ impl Default for Filter {
 pub enum FlashMode {
     Screen,
     Strobe,
+    /// Screen and strobe together.
+    Both,
     None,
 }
 
@@ -116,15 +118,29 @@ pub enum FlashMode {
 #[serde(default, deny_unknown_fields)]
 pub struct Flash {
     pub mode: FlashMode,
+    /// Light on this long before the shot, so auto-exposure meters it.
     pub lead_ms: u32,
+    /// Hard limit on how long the light stays on.
     pub max_ms: u32,
+    /// BCM number of the strobe's output line.
     pub gpio_line: u32,
-    pub pulse_ms: u32,
+    /// Accepted from older config files and ignored: the strobe is lit for
+    /// the same window as the screen flash (spec §4.5).
+    pub pulse_ms: Option<u32>,
     pub active_high: bool,
 }
 impl Default for Flash {
     fn default() -> Self {
-        Self { mode: FlashMode::Screen, lead_ms: 300, max_ms: 800, gpio_line: 17, pulse_ms: 150, active_high: true }
+        Self { mode: FlashMode::Screen, lead_ms: 300, max_ms: 800, gpio_line: 17, pulse_ms: None, active_high: true }
+    }
+}
+impl Flash {
+    pub fn screen(&self) -> bool {
+        matches!(self.mode, FlashMode::Screen | FlashMode::Both)
+    }
+
+    pub fn strobe(&self) -> bool {
+        matches!(self.mode, FlashMode::Strobe | FlashMode::Both)
     }
 }
 
@@ -170,6 +186,9 @@ impl Default for Monitor {
     }
 }
 
+/// Longest burst: 12 frames are 0.2 s at 60 fps and ~57 MB of RGB.
+pub const MAX_BURST_FRAMES: u32 = 12;
+
 fn looks_like_uuid(s: &str) -> bool {
     s.len() == 36
         && s.chars()
@@ -201,12 +220,20 @@ impl Config {
             Err(e) => tracing::warn!("ignoring malformed .env: {e}"),
         }
         cfg.immich_api_key = api_key_from(|k| std::env::var(k).ok());
+        if cfg.flash.pulse_ms.is_some() {
+            tracing::warn!(
+                "flash.pulse_ms is no longer used: the strobe is lit from flash.lead_ms before the shot until the burst ends"
+            );
+        }
         Ok(cfg)
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        if self.capture.burst_frames == 0 {
-            bail!("capture.burst_frames must be >= 1");
+        if !(1..=MAX_BURST_FRAMES).contains(&self.capture.burst_frames) {
+            bail!("capture.burst_frames must be 1..={MAX_BURST_FRAMES}");
+        }
+        if self.capture.max_shift_px > 32 {
+            bail!("capture.max_shift_px must be <= 32");
         }
         if !(1..=100).contains(&self.capture.jpeg_quality) {
             bail!("capture.jpeg_quality must be 1..=100");
@@ -237,7 +264,7 @@ impl Config {
         if self.flash.lead_ms as u64 >= self.timing.countdown_s as u64 * 1000 {
             bail!("flash.lead_ms must be shorter than the countdown (timing.countdown_s)");
         }
-        if self.button.gpio_line == self.flash.gpio_line && self.flash.mode == FlashMode::Strobe {
+        if self.button.gpio_line == self.flash.gpio_line && self.flash.strobe() {
             bail!("button.gpio_line and flash.gpio_line must differ");
         }
         Ok(())
@@ -308,6 +335,9 @@ mod tests {
     #[test]
     fn invalid_values_are_rejected() {
         assert!(Config::from_toml_str("[capture]\nburst_frames = 0\n").is_err());
+        assert!(Config::from_toml_str("[capture]\nburst_frames = 13\n").is_err());
+        assert!(Config::from_toml_str("[capture]\nmax_shift_px = 33\n").is_err());
+        assert!(Config::from_toml_str("[flash]\nmode = \"both\"\ngpio_line = 27\n").is_err());
         assert!(Config::from_toml_str("[capture]\njpeg_quality = 0\n").is_err());
         assert!(Config::from_toml_str("[flash]\nmode = \"strobe\"\ngpio_line = 27\n").is_err());
         assert!(Config::from_toml_str("[flash]\nlead_ms = 900\nmax_ms = 800\n").is_err());
@@ -322,6 +352,18 @@ mod tests {
         assert!(Config::from_toml_str("[immich]\nalbum_id = \"my-album\"\n").is_err());
         assert!(Config::from_toml_str("[immich]\nalbum_id = \"4c1d8f6e-0b2a-4f6e-9a7c-2d4e6f8a0b1g\"\n").is_err());
         assert!(Config::from_toml_str("[immich]\nalbum_id = \"4c1d8f6e-0b2a-4f6e-9a7c-2d4e6f8a0b1c\"\n").is_ok());
+    }
+
+    #[test]
+    fn flash_modes_and_old_pulse_ms() {
+        let both = Config::from_toml_str("[flash]\nmode = \"both\"\n").unwrap().flash;
+        assert!(both.screen() && both.strobe());
+        let strobe = Config::from_toml_str("[flash]\nmode = \"strobe\"\npulse_ms = 150\n").unwrap().flash;
+        assert!(!strobe.screen() && strobe.strobe());
+        assert_eq!(strobe.pulse_ms, Some(150), "old files still load");
+        let none = Config::from_toml_str("[flash]\nmode = \"none\"\n").unwrap().flash;
+        assert!(!none.screen() && !none.strobe());
+        assert!(Config::default().flash.screen());
     }
 
     #[test]
