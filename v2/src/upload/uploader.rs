@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::immich::{Failure, Immich};
 use super::queue::{Entry, Queue};
@@ -82,12 +82,34 @@ impl Drop for Uploader {
     }
 }
 
-/// Wait up to `d`; returns false when the uploader is shutting down.
-fn wait(wake: &Receiver<()>, running: &AtomicBool, d: Duration) -> bool {
-    match wake.recv_timeout(d) {
+/// Idle wait: returns early on a wake-up. Returns false when shutting down.
+fn wait_idle(wake: &Receiver<()>, running: &AtomicBool, d: Duration) -> bool {
+    let ok = match wake.recv_timeout(d) {
         Ok(()) | Err(RecvTimeoutError::Timeout) => running.load(Ordering::SeqCst),
         Err(RecvTimeoutError::Disconnected) => false,
+    };
+    wake.try_iter().for_each(drop);
+    ok
+}
+
+/// Retry wait: sleeps until the deadline, ignoring wake-ups (they only serve
+/// to notice shutdown). Returns false when shutting down.
+fn wait_retry(wake: &Receiver<()>, running: &AtomicBool, d: Duration) -> bool {
+    let deadline = Instant::now() + d;
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        if let Err(RecvTimeoutError::Disconnected) = wake.recv_timeout(left.min(Duration::from_millis(100))) {
+            return false;
+        }
     }
+    wake.try_iter().for_each(drop);
+    running.load(Ordering::SeqCst)
 }
 
 fn run(
@@ -111,6 +133,16 @@ fn run(
         for (file, mut entry) in entries {
             if !running.load(Ordering::SeqCst) {
                 return;
+            }
+            if !entry.photo.exists() {
+                tracing::warn!(photo = %entry.photo.display(), "queued photo no longer exists; dropping it from the queue");
+                match queue.done(&file) {
+                    Ok(()) => {
+                        pending.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    Err(e) => tracing::error!("{e:#}"),
+                }
+                continue;
             }
             match send(client, queue, &file, &mut entry) {
                 Ok(()) => {
@@ -140,7 +172,11 @@ fn run(
                 }
             }
         }
-        if !wait(wake, running, delay.unwrap_or(pacing.idle_rescan)) {
+        let alive = match delay {
+            Some(d) => wait_retry(wake, running, d),
+            None => wait_idle(wake, running, pacing.idle_rescan),
+        };
+        if !alive {
             return;
         }
     }
@@ -149,10 +185,6 @@ fn run(
 /// Upload (if not done yet) and add to the album, recording progress so a
 /// retry never uploads the same photo twice.
 fn send(client: &Immich, queue: &Queue, file: &std::path::Path, entry: &mut Entry) -> Result<(), Failure> {
-    if !entry.photo.exists() {
-        tracing::warn!(photo = %entry.photo.display(), "queued photo no longer exists; dropping it from the queue");
-        return Ok(());
-    }
     if entry.asset_id.is_none() {
         let up = client.upload(&entry.photo, &entry.taken)?;
         tracing::info!(photo = %entry.photo.display(), id = %up.id, duplicate = up.duplicate, "uploaded");
@@ -167,7 +199,6 @@ fn send(client: &Immich, queue: &Queue, file: &std::path::Path, entry: &mut Entr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     const ID: &str = "4c1d8f6e-0b2a-4f6e-9a7c-2d4e6f8a0b1c";
     const MS: Duration = Duration::from_millis(1);
@@ -269,5 +300,19 @@ mod tests {
         u.wake(); // without this the next scan would be 60 s away
         wait_until(|| q.is_empty());
         up.assert();
+    }
+
+    #[test]
+    fn wake_does_not_cut_backoff() {
+        let (_dir, q) = setup(1);
+        let slow = Pacing { retry_initial: 400 * MS, retry_max: 400 * MS, ..fast() };
+        let u = Uploader::start(q.clone(), Immich::new("http://127.0.0.1:9/api", "k", None), slow).unwrap();
+        wait_until(|| q.pending()[0].1.attempts >= 1);
+        for _ in 0..5 {
+            u.wake();
+        }
+        std::thread::sleep(150 * MS);
+        assert_eq!(q.pending()[0].1.attempts, 1, "wake must not trigger an early retry");
+        wait_until(|| q.pending()[0].1.attempts >= 2);
     }
 }
