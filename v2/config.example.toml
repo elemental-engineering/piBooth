@@ -4,7 +4,7 @@
 # /opt/pibooth) (v1 compatible).
 
 [storage]
-root = "."            # photos/, raw/, queue/ are created under here
+root = "."            # photos/, raw/ and the upload queue/ are created under here
 save_original = true  # keep the unfiltered photo in raw/
 
 [camera]
@@ -44,8 +44,8 @@ active_low = false    # false: button to 3.3 V, internal pull-down (v1 wiring)
 debounce_ms = 30
 
 [immich]
-base_url = ""         # e.g. "https://immich.example/api"
-album_id = ""
+base_url = ""         # API root incl. /api, e.g. "https://immich.example/api" (empty = upload off)
+album_id = ""         # optional: album UUID from the album's URL
 latitude = 0.0        # GPS omitted when both are 0.0
 longitude = 0.0
 

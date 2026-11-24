@@ -81,15 +81,15 @@ replaces it).
    └──────▲────────▲────────┘
   InputEvent│      │Status                ┌──────────────┐
    ┌────────┴──┐ ┌─┴──────────┐  enqueue  │ upload task  │
-   │ input     │ │ monitors   │ ─────────►│ (tokio, disk │
+   │ input     │ │ monitors   │ ─────────►│ (thread, disk │
    │ GPIO/keys │ │ temp/disk/ │           │  queue)      │
    └───────────┘ │ net        │           └──────────────┘
                  └────────────┘
 ```
 
 Threads: main (winit event loop + GL render + state machine), camera
-(libcamera callbacks), a rayon pool for the pipeline, plain threads for the
-monitors and the GPIO button (milestone 2), and a tokio runtime for upload (milestone 4). Communication is
+(libcamera callbacks), a photo-worker thread (a rayon pool for stacking from milestone 5), plain threads for the
+monitors and the GPIO button (milestone 2), and an upload thread (blocking `ureq` HTTP client). Communication is
 by `std::sync::mpsc` messages; the only shared memory is the preview frame
 triple buffer and a `Mutex<Status>` status snapshot.
 
@@ -107,7 +107,7 @@ triple buffer and a `Mutex<Status>` status snapshot.
 | `flash` | `Flash` trait; `ScreenFlash`, `GpioStrobe` (milestone 5; the screen flash is a view flag until then) | gpiocdev |
 | `pipeline` | Align + average burst, sharpest-frame pick, sepia, effect composite, encode, EXIF, DNG | image, jpeg-encoder, fastrand; EXIF via an in-crate TIFF writer (rayon arrives with stacking in milestone 5) |
 | `storage` | Photo folders, v1 file names, atomic writes | chrono |
-| `upload` | Persistent queue, Immich client, retries | tokio, reqwest |
+| `upload` | Persistent queue, Immich client, retries | ureq (rustls with ring, system certificate store), serde_json |
 | `monitor` | CPU temp, disk %, Immich reachability → `Status` snapshot | std threads, nix (statvfs) |
 | `app` | Wires everything; owns the render loop | all |
 
@@ -207,17 +207,32 @@ Milestone 3: one full-resolution RGB frame, processed on the single photo-worker
 
 ### 4.6 Upload
 
-- Queue: one JSON file per pending photo in `queue/` (path, timestamp,
-  attempts). Survives restarts; scanned at startup.
-- Worker: `POST {base_url}/assets` (multipart, `deviceAssetId`,
-  `deviceId = "piBooth"`, ISO-8601 `fileCreatedAt`/`fileModifiedAt`), then
-  `PUT /albums/{id}/assets` when `album_id` is set. GPS comes from EXIF;
-  the separate `PUT /assets` call is kept only as a fallback if Immich does
-  not populate location from EXIF (verified during milestone 4).
-- Response `created` or `duplicate` both count as success.
-- Timeouts: connect 5 s, total 60 s. Exponential backoff 5 s → 10 min cap.
-  Paused while the network monitor reports offline.
-- Queue file removed on success. Local photos are never deleted by v2.
+- Queue: `queue/<photo stem>.json` per photo — `photo`, `taken` (RFC 3339 UTC,
+  milliseconds), `asset_id`, `attempts`, `last_error` — written atomically by the
+  photo worker right after the photo is saved (also when upload is off, so photos
+  go up once it is configured). Processed oldest first; unreadable entries are
+  renamed `*.json.bad`.
+- Upload thread (blocking `ureq`, rustls with `ring`, system certificate store),
+  started when the API key and `base_url` are set. At start `GET /users/me`
+  logs the key's owner or the failure. Per entry: `POST {base_url}/assets`
+  (multipart: `deviceAssetId` = file name, `deviceId = "piBooth"`,
+  `fileCreatedAt` = `fileModifiedAt` = `taken`, `filename`, `isFavorite = false`,
+  `assetData`; the fields Immich 1.x/2.x require are ignored by 3.x). `created`
+  and `duplicate` both succeed; the asset id is stored in the entry, then
+  `PUT /albums/{album_id}/assets` when `album_id` is set (`success` or error
+  `duplicate` ⇒ done).
+- Date and GPS reach Immich through the photo's EXIF; v1's separate
+  `PUT /assets` location call is dropped.
+- Only `photos/` files are uploaded; `raw/` originals stay local.
+- Failures: transport errors, timeouts, 408/429/5xx ⇒ retry with backoff 5 s →
+  10 min; other 4xx (bad key, missing permission, unknown album) ⇒ "needs
+  attention", retried every 10 min. Timeouts: connect 5 s, request 120 s. The
+  oldest photo is always retried first. New photos do not shorten a pending retry
+  wait.
+- An entry is deleted once uploaded and added to the album; a missing photo file
+  drops its entry with a warning. Local photos are never deleted by v2. At quit
+  the upload thread is detached; an interrupted upload repeats at the next start
+  and the server reports a duplicate.
 
 ### 4.7 Monitors
 

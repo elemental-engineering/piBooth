@@ -5,8 +5,8 @@ Rewrite of the Python booth (`../main.py`). Design: `../docs/superpowers/specs/2
 Status: milestone 3 — live preview, button and countdown, screen flash,
 full-quality capture (high-quality noise reduction, exposure metered under the
 flash), sepia + effect overlay, JPEG with EXIF, review of the
-saved photo, status icons and camera auto-restart. Upload to Immich arrives in
-milestone 4.
+saved photo, status icons, camera auto-restart, and background upload to
+Immich that survives being offline and reboots.
 
 ## Photos
 
@@ -20,6 +20,34 @@ Every shot is saved under `storage.root` (default: the working directory):
 Photos are never mirrored, are 1456×1088 (the sensor's full resolution), JPEG
 quality `capture.jpeg_quality` (95) with full colour detail, and carry EXIF date,
 camera, exposure, ISO and — when `immich.latitude`/`longitude` are set — GPS.
+
+## Immich upload
+
+Every finished photo (from `photos/`, not the `raw/` originals) is queued in
+`queue/` right after it is saved and uploaded in the background, oldest first,
+then added to the album. Nothing is lost while the booth is offline or
+restarted; uploads resume on their own.
+
+Configure (v1's `.env` values move as shown):
+
+| v1 `.env` | v2 |
+|---|---|
+| `API_KEY` | `PIBOOTH_IMMICH_API_KEY` in the environment or `.env` (`API_KEY` still works) |
+| `BASE_URL` | `[immich] base_url` in `config.toml`, e.g. `https://immich.example/api` |
+| `ALBUM_ID` | `[immich] album_id` (optional) |
+| `latitude` / `longitude` | `[immich] latitude` / `longitude` (written into the photo's EXIF; Immich reads it) |
+
+The API key needs the `asset.upload` and `albumAsset.create` permissions (and
+`user.read` for the startup check). At startup the log says `Immich OK user=…`
+or why not. Failures retry from 5 s, doubling to 10 min; a bad key or unknown
+album is retried every 10 min — fix the config and restart, queued photos go up.
+A new photo does not cut a retry wait short: after a failure the next try is at
+the scheduled retry time.
+`d` shows the queue length and the last upload error.
+
+Without a key or `base_url`, photos are still queued and go up once upload is
+configured. HTTPS uses the Pi's certificate store, so a private CA works once
+installed with `update-ca-certificates`; plain `http://` on the LAN works too.
 
 ## Develop on a laptop (no Pi needed)
 
