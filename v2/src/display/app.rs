@@ -176,6 +176,7 @@ impl App {
             return;
         }
         let status = self.ctrl.status();
+        let (upload, upload_pending) = self.ctrl.upload_status();
         let lines = debug_text(&DebugInfo {
             display_fps: self.display_fps,
             camera_fps: self.camera_fps,
@@ -184,6 +185,8 @@ impl App {
             temp_c: status.temp_c,
             disk_pct: status.disk_pct,
             photo_count: self.ctrl.photo_count(),
+            upload: upload.map(|s| s.last_error),
+            upload_pending,
         });
         if let Err(e) = gfx.hud.set_debug_text(&mut gfx.renderer, &lines) {
             tracing::warn!("debug overlay: {e:#}");

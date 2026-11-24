@@ -69,7 +69,7 @@ impl Metrics {
 }
 
 /// Values shown by the debug overlay (`d` key).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DebugInfo {
     pub display_fps: f64,
     pub camera_fps: f64,
@@ -78,6 +78,20 @@ pub struct DebugInfo {
     pub temp_c: Option<f32>,
     pub disk_pct: Option<f32>,
     pub photo_count: usize,
+    /// `None`: upload off. `Some(error)`: on, with the last failure if any.
+    pub upload: Option<Option<String>>,
+    pub upload_pending: usize,
+}
+
+fn upload_line(d: &DebugInfo) -> String {
+    match &d.upload {
+        None => format!("Upload: off ({} queued)", d.upload_pending),
+        Some(None) => format!("Upload queue: {}", d.upload_pending),
+        Some(Some(err)) => {
+            let short: String = err.chars().take(40).collect();
+            format!("Upload queue: {} ({short})", d.upload_pending)
+        }
+    }
 }
 
 /// Debug overlay lines, top to bottom (v1's list plus camera fps).
@@ -87,6 +101,7 @@ pub fn debug_text(d: &DebugInfo) -> Vec<String> {
         format!("fps: {:.0}", d.display_fps),
         format!("Camera fps: {:.0}", d.camera_fps),
         format!("Photo count: {}", d.photo_count),
+        upload_line(d),
         format!("Mirrored: {}", d.mirror),
         format!("Filtered: {}", d.filter),
         format!("Temperature: {}", opt(d.temp_c, "°C")),
@@ -296,6 +311,8 @@ mod tests {
             temp_c: Some(48.31),
             disk_pct: None,
             photo_count: 12,
+            upload: Some(None),
+            upload_pending: 3,
         };
         assert_eq!(
             debug_text(&d),
@@ -303,6 +320,7 @@ mod tests {
                 "fps: 60",
                 "Camera fps: 60",
                 "Photo count: 12",
+                "Upload queue: 3",
                 "Mirrored: true",
                 "Filtered: false",
                 "Temperature: 48.3°C",
@@ -336,6 +354,26 @@ mod tests {
         assert_eq!(out[0].tint, [0.0, 0.0, 0.0, 0.65]);
         assert_eq!(out[1].sprite, SpriteId(4));
         assert_eq!(out[1].rect, Rect { x: 960 - 450, y: 540 - 80, w: 900, h: 160 });
+    }
+
+    #[test]
+    fn upload_line_variants() {
+        let mut d = DebugInfo {
+            display_fps: 60.0,
+            camera_fps: 60.0,
+            mirror: true,
+            filter: true,
+            temp_c: None,
+            disk_pct: None,
+            photo_count: 0,
+            upload: None,
+            upload_pending: 2,
+        };
+        assert_eq!(upload_line(&d), "Upload: off (2 queued)");
+        d.upload = Some(Some("temporary: network: Connection refused (os error 111)".into()));
+        assert_eq!(upload_line(&d), "Upload queue: 2 (temporary: network: Connection refused ()", "first 40 chars");
+        d.upload = Some(None);
+        assert_eq!(upload_line(&d), "Upload queue: 2");
     }
 
     #[test]

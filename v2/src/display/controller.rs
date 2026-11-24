@@ -21,6 +21,9 @@ use crate::pipeline::photo::PhotoJob;
 use crate::pipeline::worker::Worker;
 use crate::state::{Booth, Command, Event, Phase, Timings};
 use crate::storage::Storage;
+use crate::upload::immich::Immich;
+use crate::upload::queue::Queue;
+use crate::upload::uploader::{Pacing, UploadStatus, Uploader};
 
 /// Builds a fresh, not yet started camera. Called on a background thread
 /// when the camera is restarted.
@@ -106,6 +109,8 @@ pub struct Controller {
     _button: Option<GpioButton>,
     button_rx: Receiver<Action>,
     worker: Worker,
+    queue: Arc<Queue>,
+    uploader: Option<Uploader>,
     photo: PhotoSettings,
     review_image: Option<Rgba>,
     photo_count: usize,
@@ -159,6 +164,19 @@ impl Controller {
             }
         };
         tracing::info!(photos = photo_count, effects = effects.len(), "storage ready");
+        // Photos are queued even when upload is not configured, so they go
+        // up once it is (spec §4.8).
+        let queue = Arc::new(Queue::open(&cfg.storage.root)?);
+        let uploader = match (&cfg.immich_api_key, cfg.upload_enabled()) {
+            (Some(key), true) => {
+                let album = Some(cfg.immich.album_id.as_str());
+                Some(Uploader::start(queue.clone(), Immich::new(&cfg.immich.base_url, key, album), Pacing::default())?)
+            }
+            _ => {
+                tracing::info!(queued = queue.len(), "upload off (no Immich key or base_url); photos stay queued");
+                None
+            }
+        };
         let cam = start_camera(&factory)?;
         Ok(Self {
             booth: Booth::new(timings_from(cfg), now),
@@ -175,7 +193,9 @@ impl Controller {
             monitors: Monitors::start(cfg)?,
             _button: button,
             button_rx,
-            worker: Worker::start(storage, effects)?,
+            worker: Worker::start(storage, effects, Some(queue.clone()))?,
+            queue,
+            uploader,
             photo: PhotoSettings {
                 jpeg_quality: cfg.capture.jpeg_quality,
                 save_original: cfg.storage.save_original,
@@ -252,6 +272,19 @@ impl Controller {
         self.photo_count
     }
 
+    /// Upload state for the debug overlay: `None` when upload is off, with
+    /// the number of photos waiting either way.
+    pub fn upload_status(&self) -> (Option<UploadStatus>, usize) {
+        match &self.uploader {
+            Some(u) => {
+                let s = u.status();
+                let n = s.pending;
+                (Some(s), n)
+            }
+            None => (None, self.queue.len()),
+        }
+    }
+
     /// The processed photo to show in review, once per photo.
     pub fn take_review_image(&mut self) -> Option<Rgba> {
         self.review_image.take()
@@ -320,6 +353,9 @@ impl Controller {
                     // Only the photo being processed may reach the review screen.
                     if matches!(self.booth.phase(), Phase::Processing { id, .. } if id == result.id) {
                         self.review_image = Some(done.review);
+                    }
+                    if let Some(u) = &self.uploader {
+                        u.wake(); // the worker queued it just before reporting
                     }
                     Event::PhotoReady { id: result.id }
                 }
