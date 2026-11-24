@@ -88,7 +88,7 @@ replaces it).
 ```
 
 Threads: main (winit event loop + GL render + state machine), camera
-(libcamera callbacks), a photo-worker thread (a rayon pool for stacking from milestone 5), plain threads for the
+(libcamera callbacks), a photo-worker thread (stacking runs on the rayon pool), plain threads for the
 monitors and the GPIO button (milestone 2), and an upload thread (blocking `ureq` HTTP client). Communication is
 by `std::sync::mpsc` messages; the only shared memory is the preview frame
 triple buffer and a `Mutex<Status>` status snapshot.
@@ -104,8 +104,8 @@ triple buffer and a `Mutex<Status>` status snapshot.
 | `display` | winit window (fullscreen), glutin/glow GL context, shaders, textures, draw | winit, glutin, glow |
 | `osd` | Text/icon rasterisation and scene layout, no GL | fontdue, image |
 | `input` | `Button` trait; `GpioButton` (gpiocdev) and keyboard mapping → `InputEvent` | gpiocdev |
-| `flash` | `Flash` trait; `ScreenFlash`, `GpioStrobe` (milestone 5; the screen flash is a view flag until then) | gpiocdev |
-| `pipeline` | Align + average burst, sharpest-frame pick, sepia, effect composite, encode, EXIF, DNG | image, jpeg-encoder, fastrand; EXIF via an in-crate TIFF writer (rayon arrives with stacking in milestone 5) |
+| `flash` | `Strobe` thread driving an `Output` (`GpioLine`); the screen flash is a view flag | gpiocdev |
+| `pipeline` | Align + average burst, sharpest-frame pick, sepia, effect composite, encode, EXIF, DNG | image, jpeg-encoder, fastrand, rayon; EXIF and DNG via an in-crate TIFF writer |
 | `storage` | Photo folders, v1 file names, atomic writes | chrono |
 | `upload` | Persistent queue, Immich client, retries | ureq (rustls with ring, system certificate store), serde_json |
 | `monitor` | CPU temp, disk %, Immich reachability → `Status` snapshot | std threads, nix (statvfs) |
@@ -130,11 +130,11 @@ Idle ──press──► Countdown{deadline} ──deadline──► Capturing 
 - `Live`: live preview, no title.
 - `Countdown`: shows `N … 1` (default 5 s, matches v1's visible digits).
   AE/AWB run continuously. At `deadline - flash.lead_ms` (at least 100 ms):
-  `PrepareCapture` (high-quality noise reduction) and, in screen mode, the
-  white flash. At the deadline: `Capture{id}`; the next complete frame is the
-  photo. (Milestone 5 replaces the single frame with a burst.)
-- `Capturing`: preview continues (screen flash stays white until the photo
-  frame arrives or `flash.max_ms`; no frame within 5 s ⇒ release the camera and
+  `PrepareCapture` (high-quality noise reduction) and, unless `flash.mode =
+  "none"`, the flash. At the deadline: `Capture{id, frames}`; the next complete
+  frame is the photo, followed by the rest of the burst (§4.2).
+- `Capturing`: preview continues (the flash stays on until the burst
+  arrives or `flash.max_ms`; no frame within 5 s ⇒ release the camera and
   review shows "Oops, try again"). Presses ignored.
 - `Processing`: the photo worker filters, encodes and saves; preview continues. Failure or a 10 s timeout ⇒ review shows "Oops, try again".
 - Every capture has an id; results for another id are ignored.
@@ -150,11 +150,9 @@ Maintenance keys (keyboard): `Esc`/`q` quit, `Space` = press, `d` debug OSD,
 
 ### 4.2 Camera
 
-- Configuration: one BGR888 stream at 1456×1088 — the sensor's native size — serves preview and capture. ≈`flash.lead_ms` before the shot `PrepareCapture` sets `NoiseReductionMode = HighQuality`; the photo is the next complete frame after `Capture`. A raw Bayer stream is added in milestone 5 when `capture.save_dng = true`. Requires libcamera ≥ 0.5 (`ExposureTimeMode`/`AnalogueGainMode`); Raspberry Pi OS ships 0.5.2.
+- Configuration: one BGR888 stream at 1456×1088 — the sensor's native size — serves preview and capture. ≈`flash.lead_ms` before the shot `PrepareCapture` sets `NoiseReductionMode = HighQuality`; the photo is the next complete frame after `Capture`. When `capture.save_dng = true` a second, raw stream is configured: `SRGGB16` (16-bit unpacked Bayer, sensor size; the Pi 5 front end cannot output the sensor's packed 10-bit format and libcamera substitutes 16-bit or PiSP-compressed), so the 10 sensor bits sit at the top of each sample. Only the first burst frame's raw buffer is copied. Requires libcamera ≥ 0.5 (`ExposureTimeMode`/`AnalogueGainMode`); Raspberry Pi OS ships 0.5.2.
 - AE/AWB: auto-exposure keeps metering during the lead (screen flash on in screen mode), so it exposes the photo for the lit scene. `Capture` also switches `ExposureTimeMode` and `AnalogueGainMode` to Manual and sets `AwbEnable = false` (libcamera keeps the last computed values). Because requests are already in flight, this lock applies only to frames after the photo; it exists for milestone 5 bursts. `ReleaseCapture`, sent when the photo arrives or on capture timeout, restores Auto and Fast noise reduction.
-- Burst: Milestone 5: `capture.burst_frames` (default 6) consecutive frames at 60 fps
-  (~100 ms), taken after the photo, starting from the first frame whose metadata
-  reports `ExposureTimeMode = Manual`. With global shutter no rolling distortion exists, so alignment is
+- Burst (milestone 5): `Capture { id, frames }` delivers `capture.burst_frames` (default 6, max 12) frames as one `CapturedBurst`: the photo frame, then the first `frames - 1` frames whose metadata reports `ExposureTimeMode = Manual` (the Raspberry Pi IPA reports the mode on the request that carried the lock, ~4 frames later because requests are in flight). If no frame reports it within 8 frames, the burst continues without waiting. About 10 frames (~170 ms) from shot to complete burst. With global shutter no rolling distortion exists, so alignment is
   translation-only.
 - Tuning file: default `imx296.json` from libcamera; overridable in config.
 - `FakeCamera` produces an animated test pattern at 60 fps for laptop dev and
@@ -176,17 +174,30 @@ Maintenance keys (keyboard): `Esc`/`q` quit, `Space` = press, `d` debug OSD,
 
 ### 4.4 Image pipeline
 
-Milestone 3: one full-resolution RGB frame, processed on the single photo-worker thread (a panic or error ⇒ Oops). From milestone 5: N frames (+ optional raw) with stacking on the rayon pool.
+The photo worker processes one burst (+ optional raw frame) per job, with stacking parallelised on the rayon pool (a panic or error ⇒ Oops).
 
-1. (Milestone 5) **Stack** (`capture.stack = "average" | "sharpest" | "off"`):
-   - `average`: estimate integer-pixel translation of each frame vs. the
-     sharpest one by phase correlation on a downscaled luma; reject frames
-     whose shift exceeds `capture.max_shift_px` (default 8); average the rest
-     in `u16` accumulators.
-   - `sharpest`: pick the frame with highest variance of Laplacian.
-2. **Save original**: unfiltered image (stacked from milestone 5) → `raw/booth_<ts>.jpg`
-   (`storage.save_original`, default true). DNG of the first raw frame →
-   `raw/booth_<ts>.dng` when enabled (milestone 5).
+1. **Stack** (`capture.stack = "average" | "sharpest" | "off"`; `pipeline::stack`):
+   - reference = the frame with the highest variance of Laplacian (half-resolution luma).
+   - `average`: a frame whose mean luma differs > 6 % from the reference is
+     rejected; otherwise its integer translation is found by minimising the
+     mean absolute luma difference — full search at quarter resolution (±⌈max/4⌉+1),
+     refined ±1 at half and full resolution — and frames whose shift exceeds
+     `capture.max_shift_px` (default 8, max 32) are rejected. The rest are
+     averaged per pixel in `u16` accumulators, counting a frame's pixel only
+     where its luma is within 3σ of the reference (σ from the median absolute
+     difference, clamped to 10–60 levels): moving subjects keep the
+     reference's pixels instead of ghosting.
+   - `sharpest`: the reference frame. `off` (or a 1-frame burst): the first frame.
+   - ≈ 60 ms for 6 full frames on 4 x86 cores; within the ~300 ms budget on the Pi 5.
+2. **Save original**: unfiltered stacked image → `raw/booth_<ts>.jpg`
+   (`storage.save_original`, default true). DNG of the first frame's raw data →
+   `raw/booth_<ts>.dng` when `capture.save_dng` (written last; a DNG failure is
+   logged and never fails the photo). DNG 1.4, one uncompressed 16-bit CFA
+   strip; CFA pattern from the raw format; `BlackLevel` from `SensorBlackLevels`;
+   `WhiteLevel` = 0xFFFF minus the always-zero low bits; `ColorMatrix1` (D65) =
+   inverse of `sRGB→XYZ · ColourCorrectionMatrix · diag(gain_r, 1, gain_b)` scaled
+   so white maps to max 1; `AsShotNeutral` = (1/gain_r, 1, 1/gain_b). Verified
+   with LibRaw: colour patches decode within ±3 levels.
 3. **Filter** (when filter enabled): sepia with the standard RGB matrix,
    clamped to 255 (no max normalisation).
 4. **Effect**: a random PNG from `effects/`, resized once at startup to the
@@ -196,14 +207,19 @@ Milestone 3: one full-resolution RGB frame, processed on the single photo-worker
 
 ### 4.5 Flash
 
-`flash.mode = "screen" | "strobe" | "none"`.
+`flash.mode = "screen" | "strobe" | "both" | "none"`. The light window is the
+same for every mode: from `deadline - lead_ms` (default 300 ms, so AE meters it)
+until the burst arrives, capped at `flash.max_ms`.
 
-- `screen`: white frame from `deadline - lead_ms` (default 300 ms, to let AE
-  meter it) until the photo frame arrives (the burst from milestone 5), capped at `flash.max_ms`.
-- `strobe`: GPIO output line (`flash.gpio_line`, active level configurable)
-  driven high for `flash.pulse_ms` covering the burst, timed from the camera's
-  frame-start metadata. Exact per-exposure sync via the IMX296 external
-  trigger is out of scope for v2 (milestone 6).
+- `screen`: full-screen white quad.
+- `strobe`: GPIO output line (`flash.gpio_line`, `active_high` configurable),
+  requested as an output that starts off, driven from its own thread which
+  turns it off by itself after `max_ms` even if the render loop stalls, and
+  on drop. Missing GPIO ⇒ warning, booth runs without it. A continuous light
+  (LED panel via a driver) suits this; exact per-exposure sync of a short
+  flash via the IMX296 external trigger is milestone 6.
+- `both`: screen and strobe together.
+- `flash.pulse_ms` (older files) is accepted and ignored with a warning.
 
 ### 4.6 Upload
 
@@ -290,11 +306,10 @@ assets_dir = "."
 enabled = true
 
 [flash]
-mode = "screen"       # screen | strobe | none
+mode = "screen"       # screen | strobe | both | none
 lead_ms = 300
 max_ms = 800
 gpio_line = 17
-pulse_ms = 150
 active_high = true
 
 [button]
@@ -353,7 +368,7 @@ CLI: `pibooth [--config PATH] [--fake-camera] [--no-gpio] [--bench]`.
 | `libcamera` crate lacks needed controls/streams on PiSP | Milestone 1 spike validates; fallback is a small C++ shim via `cxx` over libcamera |
 | Dual-stream config at full res + raw not accepted by PiSP | Fall back to mode switch for capture (brief preview pause during flash) |
 | Texture upload at 60 fps too slow | PBO streaming, then dmabuf import (milestone 6) |
-| Average stacking blurs moving subjects | Shift rejection + `sharpest` mode; default chosen after Pi testing |
+| Average stacking blurs moving subjects | Shift rejection, per-pixel motion rejection against the sharpest frame, and `sharpest` mode; default chosen after Pi testing |
 | Screen-flash metering inconsistent | `lead_ms` tunable; option to fix exposure manually |
 
 ## 8. Milestones
